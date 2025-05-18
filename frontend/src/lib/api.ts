@@ -1790,3 +1790,37 @@ export const checkBillingStatus = async (): Promise<BillingStatusResponse> => {
     throw error;
   }
 };
+
+export interface AddProviderRequest {
+  alias: string;
+  model_name: string;
+  env_var_name: string;
+  api_key: string;
+}
+
+export const addProvider = async (data: AddProviderRequest): Promise<any> => {
+  const supabase = createClient();
+  const {
+    data: { session },
+  } = await supabase.auth.getSession();
+
+  if (!session?.access_token) {
+    throw new Error('No access token available');
+  }
+
+  const response = await fetch(`${API_URL}/models/providers`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${session.access_token}`,
+    },
+    body: JSON.stringify(data),
+  });
+
+  if (!response.ok) {
+    const errorText = await response.text().catch(() => '');
+    throw new Error(`Error adding provider: ${errorText}`);
+  }
+
+  return response.json();
+};
