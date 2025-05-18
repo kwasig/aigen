@@ -1,5 +1,7 @@
 'use client';
 import { useState } from 'react';
+import { useQueryClient } from '@tanstack/react-query';
+import { modelKeys } from '@/hooks/react-query/subscriptions/keys';
 import { Input } from '@/components/ui/input';
 import { Button } from '@/components/ui/button';
 import { Label } from '@/components/ui/label';
@@ -12,6 +14,7 @@ export default function AddProviderForm() {
   const [apiKey, setApiKey] = useState('');
   const [loading, setLoading] = useState(false);
   const [message, setMessage] = useState<string | null>(null);
+  const queryClient = useQueryClient();
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -19,6 +22,7 @@ export default function AddProviderForm() {
     setMessage(null);
     try {
       await addProvider({ alias, model_name: modelName, env_var_name: envVar, api_key: apiKey });
+      queryClient.invalidateQueries({ queryKey: modelKeys.available });
       setMessage('Provider added successfully');
       setAlias('');
       setModelName('');
