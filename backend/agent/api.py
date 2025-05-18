@@ -108,8 +108,8 @@ def update_env_file(var: str, value: str) -> None:
 
 class AgentStartRequest(BaseModel):
     model_name: Optional[str] = None  # Will be set from config.MODEL_TO_USE in the endpoint
-    enable_thinking: Optional[bool] = False
-    reasoning_effort: Optional[str] = 'low'
+    enable_thinking: Optional[bool] = True
+    reasoning_effort: Optional[str] = 'medium'
     stream: Optional[bool] = True
     enable_context_manager: Optional[bool] = False
 
@@ -673,8 +673,8 @@ async def generate_and_update_project_name(project_id: str, prompt: str):
 async def initiate_agent_with_files(
     prompt: str = Form(...),
     model_name: Optional[str] = Form(None),  # Default to None to use config.MODEL_TO_USE
-    enable_thinking: Optional[bool] = Form(False),
-    reasoning_effort: Optional[str] = Form("low"),
+    enable_thinking: Optional[bool] = Form(True),
+    reasoning_effort: Optional[str] = Form("medium"),
     stream: Optional[bool] = Form(True),
     enable_context_manager: Optional[bool] = Form(False),
     files: List[UploadFile] = File(default=[]),

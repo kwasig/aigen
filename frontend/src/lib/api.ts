@@ -533,6 +533,13 @@ export const startAgent = async (
       `[API] Starting agent for thread ${threadId} using ${API_URL}/thread/${threadId}/agent/start`,
     );
 
+    const bodyOptions = {
+      model_name: options?.model_name,
+      enable_thinking: options?.enable_thinking ?? true,
+      reasoning_effort: options?.reasoning_effort ?? 'medium',
+      stream: options?.stream ?? true,
+    };
+
     const response = await fetch(`${API_URL}/thread/${threadId}/agent/start`, {
       method: 'POST',
       headers: {
@@ -541,8 +548,8 @@ export const startAgent = async (
       },
       // Add cache: 'no-store' to prevent caching
       cache: 'no-store',
-      // Add the body, stringifying the options or an empty object
-      body: JSON.stringify(options || {}),
+      // Add the body with defaults applied
+      body: JSON.stringify(bodyOptions),
     });
 
     if (!response.ok) {
@@ -863,11 +870,14 @@ export const streamAgent = (
           try {
             const jsonData = JSON.parse(rawData);
             if (jsonData.status === 'error') {
-              console.error(`[STREAM] Error status received for ${agentRunId}:`, jsonData);
-              
+              console.error(
+                `[STREAM] Error status received for ${agentRunId}:`,
+                jsonData,
+              );
+
               // Pass the error message to the callback
               callbacks.onError(jsonData.message || 'Unknown error occurred');
-              
+
               // Don't close the stream for error status messages as they may continue
               return;
             }
@@ -1159,10 +1169,10 @@ export const listSandboxFiles = async (
     } = await supabase.auth.getSession();
 
     const url = new URL(`${API_URL}/sandboxes/${sandboxId}/files`);
-    
+
     // Normalize the path to handle Unicode escape sequences
     const normalizedPath = normalizePathWithUnicode(path);
-    
+
     // Properly encode the path parameter for UTF-8 support
     url.searchParams.append('path', normalizedPath);
 
@@ -1207,10 +1217,10 @@ export const getSandboxFileContent = async (
     } = await supabase.auth.getSession();
 
     const url = new URL(`${API_URL}/sandboxes/${sandboxId}/files/content`);
-    
+
     // Normalize the path to handle Unicode escape sequences
     const normalizedPath = normalizePathWithUnicode(path);
-    
+
     // Properly encode the path parameter for UTF-8 support
     url.searchParams.append('path', normalizedPath);
 
@@ -1717,42 +1727,43 @@ export const getSubscription = async (): Promise<SubscriptionStatus> => {
   }
 };
 
-export const getAvailableModels = async (): Promise<AvailableModelsResponse> => {
-  try {
-    const supabase = createClient();
-    const {
-      data: { session },
-    } = await supabase.auth.getSession();
+export const getAvailableModels =
+  async (): Promise<AvailableModelsResponse> => {
+    try {
+      const supabase = createClient();
+      const {
+        data: { session },
+      } = await supabase.auth.getSession();
 
-    if (!session?.access_token) {
-      throw new Error('No access token available');
+      if (!session?.access_token) {
+        throw new Error('No access token available');
+      }
+
+      const response = await fetch(`${API_URL}/billing/available-models`, {
+        headers: {
+          Authorization: `Bearer ${session.access_token}`,
+        },
+      });
+
+      if (!response.ok) {
+        const errorText = await response
+          .text()
+          .catch(() => 'No error details available');
+        console.error(
+          `Error getting available models: ${response.status} ${response.statusText}`,
+          errorText,
+        );
+        throw new Error(
+          `Error getting available models: ${response.statusText} (${response.status})`,
+        );
+      }
+
+      return response.json();
+    } catch (error) {
+      console.error('Failed to get available models:', error);
+      throw error;
     }
-
-    const response = await fetch(`${API_URL}/billing/available-models`, {
-      headers: {
-        Authorization: `Bearer ${session.access_token}`,
-      },
-    });
-
-    if (!response.ok) {
-      const errorText = await response
-        .text()
-        .catch(() => 'No error details available');
-      console.error(
-        `Error getting available models: ${response.status} ${response.statusText}`,
-        errorText,
-      );
-      throw new Error(
-        `Error getting available models: ${response.statusText} (${response.status})`,
-      );
-    }
-
-    return response.json();
-  } catch (error) {
-    console.error('Failed to get available models:', error);
-    throw error;
-  }
-};
+  };
 
 export const checkBillingStatus = async (): Promise<BillingStatusResponse> => {
   try {
