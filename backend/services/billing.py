@@ -8,19 +8,21 @@ from fastapi import APIRouter, HTTPException, Depends, Request
 from typing import Optional, Dict, Tuple
 import stripe
 from datetime import datetime, timezone
+import json
 from utils.logger import logger
 from utils.config import config, EnvMode
 from services.supabase import DBConnection
 from utils.auth_utils import get_current_user_id_from_jwt
 from pydantic import BaseModel
 from utils.constants import MODEL_ACCESS_TIERS
+from pathlib import Path
 # Initialize Stripe
 stripe.api_key = config.STRIPE_SECRET_KEY
 
 # Initialize router
 router = APIRouter(prefix="/billing", tags=["billing"])
 
-MODEL_NAME_ALIASES = {
+DEFAULT_MODEL_NAME_ALIASES = {
     # Short names to full names
     "sonnet-3.7": "anthropic/claude-3-7-sonnet-latest",
     # "gpt-4.1": "openai/gpt-4.1-2025-04-14",  # Commented out in constants.py
@@ -50,6 +52,21 @@ MODEL_NAME_ALIASES = {
     "qwen/qwen3-235b-a22b": "openrouter/qwen/qwen3-235b-a22b",
     # "xai/grok-3-mini-fast-beta": "xai/grok-3-mini-fast-beta",  # Commented out in constants.py
 }
+
+MODEL_NAME_ALIASES = DEFAULT_MODEL_NAME_ALIASES.copy()
+PROVIDERS_FILE = Path(__file__).resolve().parent.parent / "agent/providers.json"
+
+def load_extra_providers() -> None:
+    if PROVIDERS_FILE.exists():
+        try:
+            with open(PROVIDERS_FILE, "r") as f:
+                data = json.load(f)
+                if isinstance(data, dict):
+                    MODEL_NAME_ALIASES.update(data)
+        except Exception as e:
+            logger.error(f"Failed to load providers file: {e}")
+
+load_extra_providers()
 
 SUBSCRIPTION_TIERS = {
     config.STRIPE_FREE_TIER_ID: {'name': 'free', 'minutes': 60},
@@ -229,6 +246,9 @@ async def calculate_monthly_usage(client, user_id: str) -> float:
     
     return total_seconds / 60  # Convert to minutes
 
+ALLOWED_MODELS_CACHE: Dict[str, Dict] = {}
+ALLOWED_MODELS_TTL = 300  # seconds
+
 async def get_allowed_models_for_user(client, user_id: str):
     """
     Get the list of models allowed for a user based on their subscription tier.
@@ -236,6 +256,11 @@ async def get_allowed_models_for_user(client, user_id: str):
     Returns:
         List of model names allowed for the user's subscription tier.
     """
+
+    now = datetime.now().timestamp()
+    cached = ALLOWED_MODELS_CACHE.get(user_id)
+    if cached and now - cached["ts"] < ALLOWED_MODELS_TTL:
+        return cached["models"]
 
     subscription = await get_user_subscription(user_id)
     tier_name = 'free'
@@ -253,7 +278,9 @@ async def get_allowed_models_for_user(client, user_id: str):
             tier_name = tier_info['name']
     
     # Return allowed models for this tier
-    return MODEL_ACCESS_TIERS.get(tier_name, MODEL_ACCESS_TIERS['free'])  # Default to free tier if unknown
+    models = MODEL_ACCESS_TIERS.get(tier_name, MODEL_ACCESS_TIERS['free'])
+    ALLOWED_MODELS_CACHE[user_id] = {"ts": now, "models": models}
+    return models
 
 
 async def can_use_model(client, user_id: str, model_name: str):
@@ -897,6 +924,9 @@ async def get_available_models(
 ):
     """Get the list of models available to the user based on their subscription tier."""
     try:
+        # Reload provider list in case it changed
+        load_extra_providers()
+
         # Get Supabase client
         db = DBConnection()
         client = await db.client
