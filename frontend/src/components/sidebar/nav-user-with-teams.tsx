@@ -286,12 +286,18 @@ export function NavUserWithTeams({
                     Billing
                   </Link>
                 </DropdownMenuItem>
-                {/* <DropdownMenuItem asChild>
+                <DropdownMenuItem asChild>
                   <Link href="/settings">
                     <Settings className="mr-2 h-4 w-4" />
                     Settings
                   </Link>
-                </DropdownMenuItem> */}
+                </DropdownMenuItem>
+                <DropdownMenuItem asChild>
+                  <Link href="/settings/providers">
+                    <Settings className="mr-2 h-4 w-4" />
+                    LLM Providers
+                  </Link>
+                </DropdownMenuItem>
                 <DropdownMenuItem
                   onClick={() => setTheme(theme === 'light' ? 'dark' : 'light')}
                 >
