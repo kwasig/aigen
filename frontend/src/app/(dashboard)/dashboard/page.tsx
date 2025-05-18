@@ -83,11 +83,21 @@ function DashboardContent() {
       });
 
       // Append options
-      if (options?.model_name) formData.append('model_name', options.model_name);
-      formData.append('enable_thinking', String(options?.enable_thinking ?? false));
-      formData.append('reasoning_effort', options?.reasoning_effort ?? 'low');
+      if (options?.model_name)
+        formData.append('model_name', options.model_name);
+      formData.append(
+        'enable_thinking',
+        String(options?.enable_thinking ?? true),
+      );
+      formData.append(
+        'reasoning_effort',
+        options?.reasoning_effort ?? 'medium',
+      );
       formData.append('stream', String(options?.stream ?? true));
-      formData.append('enable_context_manager', String(options?.enable_context_manager ?? false));
+      formData.append(
+        'enable_context_manager',
+        String(options?.enable_context_manager ?? false),
+      );
 
       console.log('FormData content:', Array.from(formData.entries()));
 
@@ -178,7 +188,11 @@ function DashboardContent() {
 
       <div className="absolute top-1/2 left-1/2 transform -translate-x-1/2 -translate-y-1/2 w-[650px] max-w-[90%]">
         <div className="flex flex-col items-center text-center mb-2 w-full">
-          <h1 className={cn('tracking-tight text-4xl font-semibold leading-tight')}>
+          <h1
+            className={cn(
+              'tracking-tight text-4xl font-semibold leading-tight',
+            )}
+          >
             Hey
           </h1>
           <p className="tracking-tight text-3xl font-normal text-muted-foreground/80 mt-2 flex items-center gap-2">
