@@ -130,6 +130,8 @@ export function HeroSection() {
       // 4. Start the agent with the thread ID
       await startAgent(thread.thread_id, {
         stream: true,
+        enable_thinking: true,
+        reasoning_effort: 'medium',
       });
 
       // 5. Navigate to the new agent's thread page

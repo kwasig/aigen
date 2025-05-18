@@ -10,6 +10,7 @@ import jwt
 from pydantic import BaseModel
 import tempfile
 import os
+from pathlib import Path
 
 from agentpress.thread_manager import ThreadManager
 from services.supabase import DBConnection
@@ -32,7 +33,7 @@ instance_id = None # Global instance ID for this backend instance
 # TTL for Redis response lists (24 hours)
 REDIS_RESPONSE_LIST_TTL = 3600 * 24
 
-MODEL_NAME_ALIASES = {
+DEFAULT_MODEL_NAME_ALIASES = {
     # Short names to full names
     "sonnet-3.7": "anthropic/claude-3-7-sonnet-latest",
     # "gpt-4.1": "openai/gpt-4.1-2025-04-14",  # Commented out in constants.py
@@ -63,16 +64,65 @@ MODEL_NAME_ALIASES = {
     # "xai/grok-3-mini-fast-beta": "xai/grok-3-mini-fast-beta",  # Commented out in constants.py
 }
 
+# Mutable alias dictionary used by the API
+MODEL_NAME_ALIASES = DEFAULT_MODEL_NAME_ALIASES.copy()
+
+# Path to additional provider definitions
+PROVIDERS_FILE = Path(__file__).with_name("providers.json")
+
+def load_extra_providers() -> None:
+    if PROVIDERS_FILE.exists():
+        try:
+            with open(PROVIDERS_FILE, "r") as f:
+                data = json.load(f)
+                if isinstance(data, dict):
+                    MODEL_NAME_ALIASES.update(data)
+        except Exception as e:
+            logger.error(f"Failed to load providers file: {e}")
+
+def save_extra_providers(extra: Dict[str, str]) -> None:
+    try:
+        with open(PROVIDERS_FILE, "w") as f:
+            json.dump(extra, f, indent=2)
+    except Exception as e:
+        logger.error(f"Failed to save providers file: {e}")
+
+load_extra_providers()
+
+# Utility to update the backend .env file with new API keys
+ENV_PATH = Path(__file__).resolve().parent.parent / ".env"
+
+def update_env_file(var: str, value: str) -> None:
+    lines = []
+    if ENV_PATH.exists():
+        lines = ENV_PATH.read_text().splitlines()
+    updated = False
+    for idx, line in enumerate(lines):
+        if line.startswith(f"{var}="):
+            lines[idx] = f"{var}={value}"
+            updated = True
+            break
+    if not updated:
+        lines.append(f"{var}={value}")
+    ENV_PATH.write_text("\n".join(lines) + "\n")
+
 class AgentStartRequest(BaseModel):
     model_name: Optional[str] = None  # Will be set from config.MODEL_TO_USE in the endpoint
-    enable_thinking: Optional[bool] = False
-    reasoning_effort: Optional[str] = 'low'
+    enable_thinking: Optional[bool] = True
+    reasoning_effort: Optional[str] = 'medium'
     stream: Optional[bool] = True
     enable_context_manager: Optional[bool] = False
 
 class InitiateAgentResponse(BaseModel):
     thread_id: str
     agent_run_id: Optional[str] = None
+
+
+class AddProviderRequest(BaseModel):
+    alias: str
+    model_name: str
+    env_var_name: str
+    api_key: str
 
 def initialize(
     _thread_manager: ThreadManager,
@@ -240,6 +290,31 @@ async def get_agent_run_with_access_check(client, agent_run_id: str, user_id: st
     thread_id = agent_run_data['thread_id']
     await verify_thread_access(client, thread_id, user_id)
     return agent_run_data
+
+
+@router.post("/models/providers")
+async def add_llm_provider(request: AddProviderRequest, user_id: str = Depends(get_current_user_id_from_jwt)):
+    """Add a new LLM provider and store its API key."""
+    alias = request.alias.strip()
+    model = request.model_name.strip()
+    env_var = request.env_var_name.strip().upper()
+    api_key = request.api_key.strip()
+
+    if not alias or not model or not env_var or not api_key:
+        raise HTTPException(status_code=400, detail="Invalid provider details")
+
+    MODEL_NAME_ALIASES[alias] = model
+    extras = {k: v for k, v in MODEL_NAME_ALIASES.items() if k not in DEFAULT_MODEL_NAME_ALIASES}
+    save_extra_providers(extras)
+
+    try:
+        update_env_file(env_var, api_key)
+        os.environ[env_var] = api_key
+    except Exception as e:
+        logger.error(f"Failed to update env file: {e}")
+        raise HTTPException(status_code=500, detail="Failed to update environment file")
+
+    return {"status": "success", "alias": alias, "model": model}
 
 @router.post("/thread/{thread_id}/agent/start")
 async def start_agent(
@@ -598,8 +673,8 @@ async def generate_and_update_project_name(project_id: str, prompt: str):
 async def initiate_agent_with_files(
     prompt: str = Form(...),
     model_name: Optional[str] = Form(None),  # Default to None to use config.MODEL_TO_USE
-    enable_thinking: Optional[bool] = Form(False),
-    reasoning_effort: Optional[str] = Form("low"),
+    enable_thinking: Optional[bool] = Form(True),
+    reasoning_effort: Optional[str] = Form("medium"),
     stream: Optional[bool] = Form(True),
     enable_context_manager: Optional[bool] = Form(False),
     files: List[UploadFile] = File(default=[]),

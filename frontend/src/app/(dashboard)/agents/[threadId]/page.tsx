@@ -493,9 +493,14 @@ export default function ThreadPage({
           message 
         });
         
-        const agentPromise = startAgentMutation.mutateAsync({ 
-          threadId, 
-          options 
+        const agentPromise = startAgentMutation.mutateAsync({
+          threadId,
+          options: {
+            model_name: options?.model_name,
+            enable_thinking: options?.enable_thinking ?? true,
+            reasoning_effort: 'medium',
+            stream: true,
+          },
         });
 
         const results = await Promise.allSettled([messagePromise, agentPromise]);

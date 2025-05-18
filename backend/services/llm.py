@@ -24,7 +24,7 @@ litellm.modify_params=True
 
 # Constants
 MAX_RETRIES = 2
-RATE_LIMIT_DELAY = 30
+RATE_LIMIT_DELAY = 10
 RETRY_DELAY = 0.1
 
 class LLMError(Exception):

@@ -14,6 +14,7 @@ export default function PersonalAccountSettingsPage({
     // { name: "Profile", href: "/settings" },
     // { name: "Teams", href: "/settings/teams" },
     { name: 'Billing', href: '/settings/billing' },
+    { name: 'LLM Providers', href: '/settings/providers' },
   ];
   return (
     <div className="space-y-6 w-full">
