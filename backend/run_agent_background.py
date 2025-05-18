@@ -91,7 +91,7 @@ async def run_agent_background(
                 if total_responses % 50 == 0: # Refresh every 50 responses or so
                     try: await redis.expire(instance_active_key, redis.REDIS_KEY_TTL)
                     except Exception as ttl_err: logger.warning(f"Failed to refresh TTL for {instance_active_key}: {ttl_err}")
-                await asyncio.sleep(0.1) # Short sleep to prevent tight loop
+                await asyncio.sleep(0.05)  # Short sleep to prevent tight loop
         except asyncio.CancelledError:
             logger.info(f"Stop signal checker cancelled for {agent_run_id} (Instance: {instance_id})")
         except Exception as e:

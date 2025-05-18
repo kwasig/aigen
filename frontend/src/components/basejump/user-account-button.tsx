@@ -51,7 +51,7 @@ export default async function UserAccountButton() {
             <Link href="/dashboard">My Account</Link>
           </DropdownMenuItem>
           <DropdownMenuItem asChild>
-            <Link href="/settings">Settings</Link>
+            <Link href="/settings/providers">LLM Providers</Link>
           </DropdownMenuItem>
           <DropdownMenuItem asChild>
             <Link href="/settings/teams">Teams</Link>
