@@ -168,34 +168,8 @@ async def run_agent(
                     })
                 else:
                     logger.warning("Browser state found but no screenshot data.")
-
-                    if browser_state_text:
-                        temp_message_content_list.append({
-                            "type": "text",
-                            "text": f"The following is the current state of the browser:\n{json.dumps(browser_state_text, indent=2)}"
-                        })
-
-                    # Prioritize screenshot_url if available
-                    if screenshot_url:
-                        temp_message_content_list.append({
-                            "type": "image_url",
-                            "image_url": {
-                                "url": screenshot_url,
-                            }
-                        })
-                    elif screenshot_base64:
-                        # Fallback to base64 if URL not available
-                        temp_message_content_list.append({
-                            "type": "image_url",
-                            "image_url": {
-                                "url": f"data:image/jpeg;base64,{screenshot_base64}",
-                            }
-                        })
-                    else:
-                        logger.warning("Browser state found but no screenshot data.")
-
-                except Exception as e:
-                    logger.error(f"Error parsing browser state: {e}")
+            except Exception as e:
+                logger.error(f"Error parsing browser state: {e}")
 
         if latest_image_context_msg and latest_image_context_msg.data and len(latest_image_context_msg.data) > 0:
             try:
