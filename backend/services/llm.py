@@ -14,10 +14,12 @@ from typing import Union, Dict, Any, Optional, AsyncGenerator, List
 import os
 import json
 import asyncio
+import time
 from openai import OpenAIError
 import litellm
 from utils.logger import logger
 from utils.config import config
+from utils.metrics import LLM_CALL_LATENCY
 
 # litellm.set_verbose=True
 litellm.modify_params=True
@@ -298,12 +300,14 @@ async def make_llm_api_call(
         reasoning_effort=reasoning_effort
     )
     last_error = None
+    start_time = time.time()
     for attempt in range(MAX_RETRIES):
         try:
             logger.debug(f"Attempt {attempt + 1}/{MAX_RETRIES}")
             # logger.debug(f"API request parameters: {json.dumps(params, indent=2)}")
 
             response = await litellm.acompletion(**params)
+            LLM_CALL_LATENCY.labels(model_name).observe(time.time() - start_time)
             logger.debug(f"Successfully received API response from {model_name}")
             logger.debug(f"Response: {response}")
             return response
