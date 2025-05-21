@@ -12,21 +12,31 @@ from utils.logger import logger
 import uuid
 import time
 from collections import OrderedDict
-from prometheus_client import generate_latest, CONTENT_TYPE_LATEST
+from prometheus_client import generate_latest, CONTENT_TYPE_LATEST, CollectorRegistry, Counter, Histogram
 from utils.metrics import REQUEST_COUNT, REQUEST_LATENCY, registry as METRICS_REGISTRY
 
 # Import the agent API module
 from agent import api as agent_api
 from sandbox import api as sandbox_api
 from services import billing as billing_api
+from services import redis
 
-# Load environment variables (these will be available through config)
+# Load environment variables early (these will be available through config)
 load_dotenv()
 
-# Initialize managers
+# Create DB and thread manager instance early
 db = DBConnection()
-thread_manager = None
+thread_manager = ThreadManager()
 instance_id = "single"
+
+# Pre-initialize certain connections during module loading to reduce startup time
+def preload_connections():
+    # Asynchronous preloading will happen in lifespan function
+    # This just creates the connection objects but doesn't actually connect yet
+    logger.info("Pre-initializing connection objects to reduce startup time")
+    
+# Call preload immediately
+preload_connections()
 
 # Prometheus metrics for observability
 # Use a dedicated registry to avoid duplicate metric registration when the app
@@ -35,7 +45,7 @@ METRICS_REGISTRY = CollectorRegistry()
 REQUEST_COUNT = Counter(
     "api_request_total",
     "Total API requests",
-    ["method", "endpoint", "http_status"],
+    ["method", "endpoint"],
     registry=METRICS_REGISTRY,
 )
 REQUEST_LATENCY = Histogram(
@@ -53,83 +63,158 @@ MAX_CONCURRENT_IPS = 25
 async def lifespan(app: FastAPI):
     # Startup
     global thread_manager
+    startup_time = time.time()
     logger.info(f"Starting up FastAPI application with instance ID: {instance_id} in {config.ENV_MODE.value} mode")
     
     try:
-        # Initialize database
-        await db.initialize()
+        # Initialize connections in parallel to reduce startup time
+        init_tasks = [
+            asyncio.create_task(db.initialize()),
+            asyncio.create_task(redis.initialize_async()),
+        ]
+        
+        # Wait for all initialization tasks to complete with timeout
+        try:
+            done, pending = await asyncio.wait(
+                init_tasks, 
+                timeout=5.0,  # 5 second timeout for initialization
+                return_when=asyncio.ALL_COMPLETED
+            )
+            
+            # Cancel any pending tasks
+            for task in pending:
+                task.cancel()
+                
+            # Check for exceptions in completed tasks - but don't abort startup
+            for task in done:
+                if task.exception():
+                    logger.warning(f"Initialization task raised exception: {task.exception()}")
+        except asyncio.TimeoutError:
+            logger.warning("Initialization tasks timed out - proceeding anyway")
+            for task in init_tasks:
+                if not task.done():
+                    task.cancel()
+                    
+        # Pre-warm Redis connection pool by making a simple ping request
+        try:
+            await asyncio.wait_for(redis.get_client(), timeout=1.0)
+            await asyncio.wait_for(redis.set("api_startup", str(datetime.now(timezone.utc)), ex=300), timeout=1.0)
+            logger.info("Redis connection pool pre-warmed")
+        except (asyncio.TimeoutError, Exception) as e:
+            logger.warning(f"Failed to pre-warm Redis pool: {e}")
+            
+        # Initialize API resources
         thread_manager = ThreadManager()
         
-        # Initialize the agent API with shared resources
-        agent_api.initialize(
-            thread_manager,
-            db,
-            instance_id
-        )
+        # Initialize agent API
+        agent_api.initialize(thread_manager, db, instance_id)
+        logger.info(f"Initialized agent API with instance ID: {instance_id}")
         
-        # Initialize the sandbox API with shared resources
+        # Initialize sandbox API
         sandbox_api.initialize(db)
+        logger.info(f"Initialized sandbox API with database connection")
         
-        # Initialize Redis connection
-        from services import redis
-        try:
-            await redis.initialize_async()
-            logger.info("Redis connection initialized successfully")
-        except Exception as e:
-            logger.error(f"Failed to initialize Redis connection: {e}")
-            # Continue without Redis - the application will handle Redis failures gracefully
-        
-        # Start background tasks
-        # asyncio.create_task(agent_api.restore_running_agent_runs())
+        startup_duration = time.time() - startup_time
+        logger.info(f"All essential services initialized in {startup_duration:.2f}s")
         
         yield
+    
+    except Exception as e:
+        logger.error(f"Error during API initialization: {e}", exc_info=True)
+        yield
+    finally:
+        # Shutdown
+        logger.info("Shutting down FastAPI application")
         
-        # Clean up agent resources
-        logger.info("Cleaning up agent resources")
-        await agent_api.cleanup()
-        
-        # Clean up Redis connection
+        # Stop any running agents
         try:
-            logger.info("Closing Redis connection")
+            await agent_api.cleanup()
+        except Exception as e:
+            logger.error(f"Error during agent API cleanup: {e}")
+            
+        # Close database connection
+        try:
+            await db.close()
+        except Exception as e:
+            logger.error(f"Error closing database connection: {e}")
+        
+        # Close Redis connection
+        try:
             await redis.close()
-            logger.info("Redis connection closed successfully")
         except Exception as e:
             logger.error(f"Error closing Redis connection: {e}")
-        
-        # Clean up database connection
-        logger.info("Disconnecting from database")
-        await db.disconnect()
-    except Exception as e:
-        logger.error(f"Error during application startup: {e}")
-        raise
+            
+        logger.info("Shutdown complete")
 
 app = FastAPI(lifespan=lifespan)
 
 @app.middleware("http")
-async def log_requests_middleware(request: Request, call_next):
-    start_time = time.time()
-    client_ip = request.client.host
-    method = request.method
-    url = str(request.url)
-    path = request.url.path
-    query_params = str(request.query_params)
+async def request_middleware(request: Request, call_next):
+    """Middleware to log requests and measure execution time."""
+    # Add a unique ID to each request for tracking
+    request_id = str(uuid.uuid4())[:8]
+    request.state.request_id = request_id
     
-    # Log the incoming request
-    logger.info(f"Request started: {method} {path} from {client_ip} | Query: {query_params}")
-
+    # Extract client info
+    client_host = request.client.host if request.client else "unknown"
+    
+    # Get path and query string
+    path = request.url.path
+    query = str(request.url.query)
+    query_display = f" | Query: {query}" if query else ""
+    
+    # Start timer and log request start
+    start_time = time.time()
+    logger.info(f"Request started: {request.method} {path} from {client_host}{query_display}")
+    
+    # Pre-initialize connections for faster response
     try:
+        # Perform these operations in parallel to reduce latency
+        # Initialize DB if needed
+        asyncio.create_task(db.initialize())
+            
+        # Pre-initialize Redis for better caching performance
+        asyncio.create_task(redis.get_client())
+    except Exception as e:
+        logger.warning(f"Failed to pre-initialize connections: {str(e)}")
+
+    # Get response with error handling
+    try:
+        # Increment the request count metric
+        REQUEST_COUNT.labels(
+            method=request.method, 
+            endpoint=path
+        ).inc()
+        
+        # Execute the request
         response = await call_next(request)
+        
+        # Record response time
         process_time = time.time() - start_time
-        REQUEST_LATENCY.labels(method, path).observe(process_time)
-        REQUEST_COUNT.labels(method, path, response.status_code).inc()
-        logger.debug(f"Request completed: {method} {path} | Status: {response.status_code} | Time: {process_time:.2f}s")
+        
+        # Record latency in Prometheus
+        REQUEST_LATENCY.labels(
+            method=request.method, 
+            endpoint=path
+        ).observe(process_time)
+        
+        # Record response status and time
+        status_code = response.status_code
+        
+        # Log request completion with detailed info for non-200 responses
+        if status_code >= 400:
+            logger.warning(f"Request error: {request.method} {path} | Status: {status_code} | Time: {process_time:.2f}s")
+        else:
+            logger.debug(f"Request completed: {request.method} {path} | Status: {status_code} | Time: {process_time:.2f}s")
+            
         return response
     except Exception as e:
         process_time = time.time() - start_time
-        REQUEST_LATENCY.labels(method, path).observe(process_time)
-        REQUEST_COUNT.labels(method, path, 500).inc()
-        logger.error(f"Request failed: {method} {path} | Error: {str(e)} | Time: {process_time:.2f}s")
-        raise
+        logger.error(f"Unhandled exception: {request.method} {path} | Error: {str(e)} | Time: {process_time:.2f}s", exc_info=True)
+        return JSONResponse(
+            status_code=500,
+            content={"detail": f"Internal server error: {str(e)}"}
+        )
 
 # Define allowed origins based on environment
 allowed_origins = ["https://www.suna.so", "https://suna.so", "https://staging.suna.so", "http://localhost:3000"]

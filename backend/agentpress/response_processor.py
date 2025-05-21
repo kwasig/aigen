@@ -1063,7 +1063,12 @@ class ResponseProcessor:
             function_name = tool_call["function_name"]
             arguments = tool_call["arguments"]
             
-            logger.info(f"Executing tool: {function_name} with arguments: {arguments}")
+            # Skip detailed logging for common tools to reduce overhead
+            is_common_tool = function_name in {"search_file", "read_file", "list_directory"}
+            if not is_common_tool:
+                logger.info(f"Executing tool: {function_name} with arguments: {arguments}")
+            else:
+                logger.debug(f"Executing common tool: {function_name}")
             
             if isinstance(arguments, str):
                 try:
@@ -1071,21 +1076,32 @@ class ResponseProcessor:
                 except json.JSONDecodeError:
                     arguments = {"text": arguments}
             
-            # Get available functions from tool registry
-            available_functions = self.tool_registry.get_available_functions()
+            # Use cached available functions to avoid registry lookup overhead
+            if not hasattr(self, '_cached_functions'):
+                self._cached_functions = self.tool_registry.get_available_functions()
             
             # Look up the function by name
-            tool_fn = available_functions.get(function_name)
+            tool_fn = self._cached_functions.get(function_name)
             if not tool_fn:
                 logger.error(f"Tool function '{function_name}' not found in registry")
                 return ToolResult(success=False, output=f"Tool function '{function_name}' not found")
             
-            logger.debug(f"Found tool function for '{function_name}', executing...")
-            result = await tool_fn(**arguments)
-            logger.info(f"Tool execution complete: {function_name} -> {result}")
+            # Execute the tool with timeouts for critical tools
+            if function_name in {"execute_command", "write_file", "delete_file"}:
+                # Critical tools get a longer timeout
+                result = await asyncio.wait_for(tool_fn(**arguments), timeout=30.0)
+            else:
+                # Standard tools
+                result = await tool_fn(**arguments)
+                
+            if not is_common_tool:
+                logger.info(f"Tool execution complete: {function_name}")
             return result
+        except asyncio.TimeoutError:
+            logger.error(f"Timeout executing tool {tool_call.get('function_name', 'unknown')}")
+            return ToolResult(success=False, output=f"Tool execution timed out after 30 seconds")
         except Exception as e:
-            logger.error(f"Error executing tool {tool_call['function_name']}: {str(e)}", exc_info=True)
+            logger.error(f"Error executing tool {tool_call.get('function_name', 'unknown')}: {str(e)}", exc_info=True)
             return ToolResult(success=False, output=f"Error executing tool: {str(e)}")
 
     async def _execute_tools(

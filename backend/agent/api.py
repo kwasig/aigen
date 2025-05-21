@@ -11,6 +11,7 @@ from pydantic import BaseModel
 import tempfile
 import os
 from pathlib import Path
+import time
 
 from agentpress.thread_manager import ThreadManager
 from services.supabase import DBConnection
@@ -327,6 +328,7 @@ async def start_agent(
     user_id: str = Depends(get_current_user_id_from_jwt)
 ):
     """Start an agent for a specific thread in the background."""
+    start_time = time.time()
     global instance_id # Ensure instance_id is accessible
     if not instance_id:
         raise HTTPException(status_code=500, detail="Agent API not initialized with instance ID")
@@ -349,47 +351,82 @@ async def start_agent(
     logger.info(f"Starting new agent for thread: {thread_id} with config: model={model_name}, thinking={body.enable_thinking}, effort={body.reasoning_effort}, stream={body.stream}, context_manager={body.enable_context_manager} (Instance: {instance_id})")
     client = await db.client
 
-    await verify_thread_access(client, thread_id, user_id)
-    thread_result = await client.table('threads').select('project_id', 'account_id').eq('thread_id', thread_id).execute()
+    # Create tasks for parallel execution to reduce latency
+    # 1. Access check
+    access_check_task = asyncio.create_task(verify_thread_access(client, thread_id, user_id))
+    # 2. Get thread data
+    thread_data_task = asyncio.create_task(client.table('threads').select('project_id', 'account_id').eq('thread_id', thread_id).execute())
+    
+    # Wait for both tasks to complete
+    try:
+        done, pending = await asyncio.wait(
+            [access_check_task, thread_data_task],
+            timeout=5.0,  # Add timeout to prevent hanging
+            return_when=asyncio.ALL_COMPLETED
+        )
+        # Cancel any pending tasks
+        for task in pending:
+            task.cancel()
+            
+        # Check for exceptions
+        for task in done:
+            if task.exception():
+                raise task.exception()
+    except Exception as e:
+        logger.error(f"Error during parallel thread checks: {e}")
+        raise HTTPException(status_code=500, detail=f"Error verifying thread access: {str(e)}")
+
+    # Process thread data result
+    thread_result = thread_data_task.result()
     if not thread_result.data:
         raise HTTPException(status_code=404, detail="Thread not found")
     thread_data = thread_result.data[0]
     project_id = thread_data.get('project_id')
     account_id = thread_data.get('account_id')
 
-    can_use, model_message, allowed_models = await can_use_model(client, account_id, model_name)
+    # Run billing and model checks in parallel
+    billing_check_task = asyncio.create_task(check_billing_status(client, account_id))
+    model_check_task = asyncio.create_task(can_use_model(client, account_id, model_name))
+    active_run_check_task = asyncio.create_task(check_for_active_project_agent_run(client, project_id))
+    
+    # Wait for all tasks to complete
+    try:
+        done, pending = await asyncio.wait(
+            [billing_check_task, model_check_task, active_run_check_task],
+            timeout=5.0,
+            return_when=asyncio.ALL_COMPLETED
+        )
+        # Cancel any pending tasks
+        for task in pending:
+            task.cancel()
+            
+        # Check for exceptions
+        for task in done:
+            if task.exception():
+                raise task.exception()
+    except Exception as e:
+        logger.error(f"Error during parallel checks: {e}")
+        raise HTTPException(status_code=500, detail=f"Error during authorization checks: {str(e)}")
+
+    # Process results
+    can_use, model_message, allowed_models = model_check_task.result()
     if not can_use:
         raise HTTPException(status_code=403, detail={"message": model_message, "allowed_models": allowed_models})
 
-    can_run, message, subscription = await check_billing_status(client, account_id)
+    can_run, message, subscription = billing_check_task.result()
     if not can_run:
         raise HTTPException(status_code=402, detail={"message": message, "subscription": subscription})
 
-    active_run_id = await check_for_active_project_agent_run(client, project_id)
+    active_run_id = active_run_check_task.result()
     if active_run_id:
         logger.info(f"Stopping existing agent run {active_run_id} for project {project_id}")
         await stop_agent_run(active_run_id)
 
-    try:
-        # Get project data to find sandbox ID
-        project_result = await client.table('projects').select('*').eq('project_id', project_id).execute()
-        if not project_result.data:
-            raise HTTPException(status_code=404, detail="Project not found")
-        
-        project_data = project_result.data[0]
-        sandbox_info = project_data.get('sandbox', {})
-        if not sandbox_info.get('id'):
-            raise HTTPException(status_code=404, detail="No sandbox found for this project")
-            
-        sandbox_id = sandbox_info['id']
-        sandbox = await get_or_start_sandbox(sandbox_id)
-        logger.info(f"Successfully started sandbox {sandbox_id} for project {project_id}")
-    except Exception as e:
-        logger.error(f"Failed to start sandbox for project {project_id}: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Failed to initialize sandbox: {str(e)}")
-
+    # Fast path: Skip sandbox initialization and register agent run immediately
+    # This will let the frontend see progress faster
     agent_run = await client.table('agent_runs').insert({
-        "thread_id": thread_id, "status": "running",
+        "thread_id": thread_id, 
+        "status": "initializing",  # Start with initializing to indicate progress
         "started_at": datetime.now(timezone.utc).isoformat()
     }).execute()
     agent_run_id = agent_run.data[0]['id']
@@ -402,51 +439,97 @@ async def start_agent(
     except Exception as e:
         logger.warning(f"Failed to register agent run in Redis ({instance_key}): {str(e)}")
 
-    # Run the agent in the background
-    run_agent_background.send(
-        agent_run_id=agent_run_id, thread_id=thread_id, instance_id=instance_id,
-        project_id=project_id,
-        model_name=model_name,  # Already resolved above
-        enable_thinking=body.enable_thinking, reasoning_effort=body.reasoning_effort,
-        stream=body.stream, enable_context_manager=body.enable_context_manager
+    # Start a background task to handle sandbox initialization
+    # This allows us to return a response to the frontend immediately
+    asyncio.create_task(
+        initialize_sandbox_and_start_agent(
+            agent_run_id=agent_run_id,
+            thread_id=thread_id,
+            instance_id=instance_id,
+            project_id=project_id,
+            model_name=model_name,
+            enable_thinking=body.enable_thinking,
+            reasoning_effort=body.reasoning_effort,
+            stream=body.stream,
+            enable_context_manager=body.enable_context_manager
+        )
     )
 
-    return {"agent_run_id": agent_run_id, "status": "running"}
+    process_time = time.time() - start_time
+    logger.info(f"start_agent completed in {process_time:.2f}s, returning response")
+    
+    return {"agent_run_id": agent_run_id, "status": "initializing"}
 
-@router.post("/agent-run/{agent_run_id}/stop")
-async def stop_agent(agent_run_id: str, user_id: str = Depends(get_current_user_id_from_jwt)):
-    """Stop a running agent."""
-    logger.info(f"Received request to stop agent run: {agent_run_id}")
-    client = await db.client
-    await get_agent_run_with_access_check(client, agent_run_id, user_id)
-    await stop_agent_run(agent_run_id)
-    return {"status": "stopped"}
 
-@router.get("/thread/{thread_id}/agent-runs")
-async def get_agent_runs(thread_id: str, user_id: str = Depends(get_current_user_id_from_jwt)):
-    """Get all agent runs for a thread."""
-    logger.info(f"Fetching agent runs for thread: {thread_id}")
+async def initialize_sandbox_and_start_agent(
+    agent_run_id: str,
+    thread_id: str,
+    instance_id: str,
+    project_id: str,
+    model_name: str,
+    enable_thinking: bool,
+    reasoning_effort: str,
+    stream: bool,
+    enable_context_manager: bool
+):
+    """Background task to initialize sandbox and start agent."""
     client = await db.client
-    await verify_thread_access(client, thread_id, user_id)
-    agent_runs = await client.table('agent_runs').select('*').eq("thread_id", thread_id).order('created_at', desc=True).execute()
-    logger.debug(f"Found {len(agent_runs.data)} agent runs for thread: {thread_id}")
-    return {"agent_runs": agent_runs.data}
+    
+    try:
+        # Get project data to find sandbox ID
+        project_result = await client.table('projects').select('*').eq('project_id', project_id).execute()
+        if not project_result.data:
+            logger.error(f"Project not found: {project_id}")
+            await update_agent_run_status(client, agent_run_id, "failed", error="Project not found")
+            return
+        
+        project_data = project_result.data[0]
+        sandbox_info = project_data.get('sandbox', {})
+        if not sandbox_info.get('id'):
+            logger.error(f"No sandbox found for project: {project_id}")
+            await update_agent_run_status(client, agent_run_id, "failed", error="No sandbox found for this project")
+            return
+            
+        sandbox_id = sandbox_info['id']
+        
+        # Update status to show progress
+        await update_agent_run_status(
+            client, 
+            agent_run_id, 
+            "preparing",  # Transitional status
+            responses=[{"type": "status", "status": "preparing", "message": "Starting sandbox..."}]
+        )
+        
+        # Start sandbox
+        try:
+            sandbox = await get_or_start_sandbox(sandbox_id)
+            logger.info(f"Successfully started sandbox {sandbox_id} for project {project_id}")
+        except Exception as e:
+            logger.error(f"Failed to start sandbox for project {project_id}: {str(e)}")
+            await update_agent_run_status(client, agent_run_id, "failed", error=f"Failed to initialize sandbox: {str(e)}")
+            return
 
-@router.get("/agent-run/{agent_run_id}")
-async def get_agent_run(agent_run_id: str, user_id: str = Depends(get_current_user_id_from_jwt)):
-    """Get agent run status and responses."""
-    logger.info(f"Fetching agent run details: {agent_run_id}")
-    client = await db.client
-    agent_run_data = await get_agent_run_with_access_check(client, agent_run_id, user_id)
-    # Note: Responses are not included here by default, they are in the stream or DB
-    return {
-        "id": agent_run_data['id'],
-        "threadId": agent_run_data['thread_id'],
-        "status": agent_run_data['status'],
-        "startedAt": agent_run_data['started_at'],
-        "completedAt": agent_run_data['completed_at'],
-        "error": agent_run_data['error']
-    }
+        # Update to running status
+        await update_agent_run_status(
+            client, 
+            agent_run_id, 
+            "running",
+            responses=[{"type": "status", "status": "running", "message": "Agent is running..."}]
+        )
+        
+        # Run the agent in the background
+        run_agent_background.send(
+            agent_run_id=agent_run_id, thread_id=thread_id, instance_id=instance_id,
+            project_id=project_id,
+            model_name=model_name,  # Already resolved above
+            enable_thinking=enable_thinking, reasoning_effort=reasoning_effort,
+            stream=stream, enable_context_manager=enable_context_manager
+        )
+        
+    except Exception as e:
+        logger.error(f"Error in sandbox initialization for agent run {agent_run_id}: {str(e)}")
+        await update_agent_run_status(client, agent_run_id, "failed", error=f"Failed to start agent: {str(e)}")
+
 
 @router.get("/agent-run/{agent_run_id}/stream")
 async def stream_agent_run(
@@ -455,128 +538,307 @@ async def stream_agent_run(
     request: Request = None
 ):
     """Stream the responses of an agent run using Redis Lists and Pub/Sub."""
+    stream_start_time = time.time()
     logger.info(f"Starting stream for agent run: {agent_run_id}")
     client = await db.client
 
-    user_id = await get_user_id_from_stream_auth(request, token)
-    agent_run_data = await get_agent_run_with_access_check(client, agent_run_id, user_id)
+    # Get user auth in parallel with Redis prep to reduce latency
+    auth_task = asyncio.create_task(get_user_id_from_stream_auth(request, token))
 
+    # Prepare Redis keys/channels in advance
     response_list_key = f"agent_run:{agent_run_id}:responses"
     response_channel = f"agent_run:{agent_run_id}:new_response"
     control_channel = f"agent_run:{agent_run_id}:control" # Global control channel
 
+    # Prepare Redis connection for faster access - with 1 second timeout
+    try:
+        redis_client = await asyncio.wait_for(redis.get_client(), timeout=1.0)
+    except asyncio.TimeoutError:
+        logger.warning(f"Redis client timeout for agent run {agent_run_id}, proceeding with defaults")
+        redis_client = None
+    
+    # Define helper function to set up pubsub channels
+    async def setup_pubsub_channels():
+        psr = await redis.create_pubsub()
+        await psr.subscribe(response_channel)
+        
+        psc = await redis.create_pubsub()
+        await psc.subscribe(control_channel)
+        
+        return psr, psc
+    
+    # Now get the auth result
+    try:
+        # Use a shorter timeout for auth check to improve responsiveness
+        user_id = await asyncio.wait_for(auth_task, timeout=1.0)
+    except asyncio.TimeoutError:
+        logger.warning(f"Auth timeout for agent run {agent_run_id}, treating as unauthenticated")
+        raise HTTPException(status_code=401, detail="Authentication timed out")
+    except Exception as e:
+        logger.error(f"Auth error: {e}")
+        raise HTTPException(status_code=401, detail="Authentication failed")
+    
+    # Check if the user has access to this agent run
+    try:
+        # Use a shorter timeout for access check
+        agent_run_data = await asyncio.wait_for(
+            get_agent_run_with_access_check(client, agent_run_id, user_id),
+            timeout=1.0
+        )
+    except asyncio.TimeoutError:
+        logger.warning(f"Access check timeout for agent run {agent_run_id}")
+        raise HTTPException(status_code=408, detail="Request timeout during access check")
+    except HTTPException as e:
+        raise e  # Re-raise HTTP exceptions directly
+    except Exception as e:
+        logger.error(f"Error getting agent run: {e}")
+        raise HTTPException(status_code=500, detail=f"Error accessing agent run: {str(e)}")
+
+    # Log performance metric for initial request processing
+    initial_process_time = time.time() - stream_start_time
+    logger.info(f"Initial stream setup completed in {initial_process_time:.2f}s, starting stream generation")
+
     async def stream_generator():
-        logger.debug(f"Streaming responses for {agent_run_id} using Redis list {response_list_key} and channel {response_channel}")
+        logger.debug(f"Streaming responses for {agent_run_id}")
         last_processed_index = -1
         pubsub_response = None
         pubsub_control = None
         listener_task = None
         terminate_stream = False
         initial_yield_complete = False
+        generator_start_time = time.time()
 
         try:
-            # 1. Fetch and yield initial responses from Redis list
-            initial_responses_json = await redis.lrange(response_list_key, 0, -1)
-            initial_responses = []
-            if initial_responses_json:
-                initial_responses = [json.loads(r) for r in initial_responses_json]
-                logger.debug(f"Sending {len(initial_responses)} initial responses for {agent_run_id}")
-                for response in initial_responses:
-                    yield f"data: {json.dumps(response)}\n\n"
-                last_processed_index = len(initial_responses) - 1
-            initial_yield_complete = True
+            # 1. Immediately yield an initial status message to reduce perceived latency
+            # This lets the client know we're starting to process
+            initial_status = {"type": "status", "status": "connecting", "message": "Starting up agent connection..."}
+            yield f"data: {json.dumps(initial_status)}\n\n"
+            initial_yield_complete = True  # Mark that we've sent at least one message
+            
+            # Yield current agent status immediately based on database record
+            agent_status = {"type": "status", "status": agent_run_data['status'], "message": f"Agent status: {agent_run_data['status']}"}
+            yield f"data: {json.dumps(agent_status)}\n\n"
+            
+            # Start a background task for initial data fetching
+            polling_task = asyncio.create_task(poll_for_new_responses(0.2))  # Start polling immediately with a short interval
+            
+            # 2. Fetch and yield initial responses from Redis list with a timeout
+            try:
+                initial_responses_json = await asyncio.wait_for(
+                    redis.lrange(response_list_key, 0, -1), 
+                    timeout=1.0  # Reduced timeout for better responsiveness
+                )
+                initial_responses = []
+                if initial_responses_json:
+                    initial_responses = [json.loads(r) for r in initial_responses_json]
+                    logger.debug(f"Sending {len(initial_responses)} initial responses for {agent_run_id}")
+                    for response in initial_responses:
+                        yield f"data: {json.dumps(response)}\n\n"
+                    last_processed_index = len(initial_responses) - 1
+                elif agent_run_data['status'] not in ['running', 'initializing', 'preparing']:
+                    # If no responses and not in a running state, yield the status
+                    status_response = {
+                        "type": "status", 
+                        "status": agent_run_data['status'],
+                        "message": f"Agent is in {agent_run_data['status']} state"
+                    }
+                    yield f"data: {json.dumps(status_response)}\n\n"
+                    
+                initial_yield_complete = True
+                # Log how long it took to deliver first response
+                first_response_time = time.time() - generator_start_time
+                logger.info(f"First responses delivered in {first_response_time:.2f}s for {agent_run_id}")
+                
+            except asyncio.TimeoutError:
+                logger.warning(f"Initial Redis fetch timed out for {agent_run_id}")
+                initial_yield_complete = True  # Still mark as complete to continue
+                # Yield a fallback message
+                fallback_status = {"type": "status", "status": "connecting", "message": "Still connecting..."}
+                yield f"data: {json.dumps(fallback_status)}\n\n"
+            
+            # 3. Check run status in parallel with Pub/Sub setup
+            status_check_task = asyncio.create_task(
+                client.table('agent_runs').select('status').eq("id", agent_run_id).maybe_single().execute()
+            )
 
-            # 2. Check run status *after* yielding initial data
-            run_status = await client.table('agent_runs').select('status').eq("id", agent_run_id).maybe_single().execute()
-            current_status = run_status.data.get('status') if run_status.data else None
-
-            if current_status != 'running':
-                logger.info(f"Agent run {agent_run_id} is not running (status: {current_status}). Ending stream.")
-                yield f"data: {json.dumps({'type': 'status', 'status': 'completed'})}\n\n"
-                return
-
-            # 3. Set up Pub/Sub listeners for new responses and control signals
-            pubsub_response = await redis.create_pubsub()
-            await pubsub_response.subscribe(response_channel)
-            logger.debug(f"Subscribed to response channel: {response_channel}")
-
-            pubsub_control = await redis.create_pubsub()
-            await pubsub_control.subscribe(control_channel)
-            logger.debug(f"Subscribed to control channel: {control_channel}")
-
+            # 4. Set up Pub/Sub listeners for new responses and control signals
+            pubsub_setup_task = asyncio.create_task(setup_pubsub_channels())
+            
+            # Wait for both tasks with timeout
+            try:
+                done, pending = await asyncio.wait(
+                    [status_check_task, pubsub_setup_task],
+                    timeout=2.0,
+                    return_when=asyncio.ALL_COMPLETED
+                )
+                # Cancel any pending tasks
+                for task in pending:
+                    task.cancel()
+                
+                # Process status check result
+                if status_check_task in done and not status_check_task.exception():
+                    run_status = status_check_task.result()
+                    current_status = run_status.data.get('status') if run_status.data else None
+                    
+                    if current_status != 'running' and current_status not in ['initializing', 'preparing']:
+                        logger.info(f"Agent run {agent_run_id} is not running (status: {current_status}). Ending stream.")
+                        yield f"data: {json.dumps({'type': 'status', 'status': current_status})}\n\n"
+                        return
+                
+                # Process pubsub setup result
+                if pubsub_setup_task in done and not pubsub_setup_task.exception():
+                    pubsub_response, pubsub_control = pubsub_setup_task.result()
+                else:
+                    logger.warning(f"Pubsub setup failed for {agent_run_id}")
+                    # Continue anyway - we'll check again if pubsub is available
+                
+            except Exception as e:
+                logger.warning(f"Error setting up status check or pubsub: {e}")
+                # Continue anyway to show existing messages
+            
+            # If pubsub setup failed, try again
+            if pubsub_response is None or pubsub_control is None:
+                try:
+                    pubsub_response, pubsub_control = await asyncio.wait_for(
+                        setup_pubsub_channels(),
+                        timeout=2.0
+                    )
+                except Exception as e:
+                    logger.warning(f"Second pubsub setup attempt failed: {e}")
+                    # Continue without pubsub - we'll use polling fallback
+            
             # Queue to communicate between listeners and the main generator loop
             message_queue = asyncio.Queue()
 
             async def listen_messages():
-                response_reader = pubsub_response.listen()
-                control_reader = pubsub_control.listen()
-                tasks = [asyncio.create_task(response_reader.__anext__()), asyncio.create_task(control_reader.__anext__())]
+                try:
+                    if pubsub_response is None or pubsub_control is None:
+                        logger.warning("Cannot start message listener as pubsub is not available")
+                        return
+                        
+                    response_reader = pubsub_response.listen()
+                    control_reader = pubsub_control.listen()
+                    tasks = [
+                        asyncio.create_task(response_reader.__anext__()), 
+                        asyncio.create_task(control_reader.__anext__())
+                    ]
 
+                    while not terminate_stream:
+                        done, pending = await asyncio.wait(
+                            tasks, 
+                            return_when=asyncio.FIRST_COMPLETED,
+                            timeout=0.5  # Add timeout to prevent blocking indefinitely
+                        )
+                        
+                        # Check if we timed out
+                        if not done:
+                            await asyncio.sleep(0.01)  # Small sleep to prevent tight loop
+                            continue
+                            
+                        for task in done:
+                            try:
+                                message = task.result()
+                                if message and isinstance(message, dict) and message.get("type") == "message":
+                                    channel = message.get("channel")
+                                    data = message.get("data")
+                                    if isinstance(data, bytes): data = data.decode('utf-8')
+
+                                    if channel == response_channel and data == "new":
+                                        await message_queue.put({"type": "new_response"})
+                                    elif channel == control_channel and data in ["STOP", "END_STREAM", "ERROR"]:
+                                        logger.info(f"Received control signal '{data}' for {agent_run_id}")
+                                        await message_queue.put({"type": "control", "data": data})
+                                        return # Stop listening on control signal
+
+                            except StopAsyncIteration:
+                                logger.warning(f"Listener {task} stopped.")
+                                return
+                            except Exception as e:
+                                logger.error(f"Error in listener for {agent_run_id}: {e}")
+                                return
+                            finally:
+                                # Reschedule the completed listener task
+                                if task in tasks:
+                                    tasks.remove(task)
+                                    if message and isinstance(message, dict):
+                                        if message.get("channel") == response_channel:
+                                            tasks.append(asyncio.create_task(response_reader.__anext__()))
+                                        elif message.get("channel") == control_channel:
+                                            tasks.append(asyncio.create_task(control_reader.__anext__()))
+
+                    # Cancel pending listener tasks on exit
+                    for p_task in pending: p_task.cancel()
+                    for task in tasks: task.cancel()
+                    
+                except Exception as e:
+                    logger.error(f"Fatal error in message listener: {e}")
+                    await message_queue.put({"type": "error", "data": f"Listener failed: {str(e)}"})
+
+            # Start message listener if pubsub is available
+            if pubsub_response is not None and pubsub_control is not None:
+                listener_task = asyncio.create_task(listen_messages())
+            else:
+                # Set up polling fallback for when pubsub isn't available
+                polling_interval = 0.5  # seconds
+                asyncio.create_task(poll_for_new_responses(polling_interval))
+                
+            async def poll_for_new_responses(interval):
+                """Fallback polling mechanism when pubsub isn't available."""
+                logger.info(f"Starting polling fallback for {agent_run_id} with interval {interval}s")
+                last_check_time = time.time()
+                # Initial poll immediately
+                await message_queue.put({"type": "new_response"})
+                
                 while not terminate_stream:
-                    done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
-                    for task in done:
-                        try:
-                            message = task.result()
-                            if message and isinstance(message, dict) and message.get("type") == "message":
-                                channel = message.get("channel")
-                                data = message.get("data")
-                                if isinstance(data, bytes): data = data.decode('utf-8')
+                    try:
+                        # Check Redis directly - use a shorter interval for better responsiveness
+                        await asyncio.sleep(interval * 0.5)  # Poll more frequently
+                        await message_queue.put({"type": "new_response"})
+                        
+                        # Also check run status periodically (every 5 polling intervals)
+                        current_time = time.time()
+                        if current_time - last_check_time > interval * 3:  # Check status more frequently
+                            last_check_time = current_time
+                            status_result = await client.table('agent_runs').select('status').eq("id", agent_run_id).maybe_single().execute()
+                            if status_result.data:
+                                status = status_result.data.get('status')
+                                if status in ['completed', 'failed', 'stopped']:
+                                    await message_queue.put({"type": "control", "data": status.upper()})
+                                    return  # Stop polling
+                    except Exception as e:
+                        logger.error(f"Error in polling fallback: {e}")
+                        await asyncio.sleep(interval * 2)  # Back off on error
 
-                                if channel == response_channel and data == "new":
-                                    await message_queue.put({"type": "new_response"})
-                                elif channel == control_channel and data in ["STOP", "END_STREAM", "ERROR"]:
-                                    logger.info(f"Received control signal '{data}' for {agent_run_id}")
-                                    await message_queue.put({"type": "control", "data": data})
-                                    return # Stop listening on control signal
-
-                        except StopAsyncIteration:
-                            logger.warning(f"Listener {task} stopped.")
-                            # Decide how to handle listener stopping, maybe terminate?
-                            await message_queue.put({"type": "error", "data": "Listener stopped unexpectedly"})
-                            return
-                        except Exception as e:
-                            logger.error(f"Error in listener for {agent_run_id}: {e}")
-                            await message_queue.put({"type": "error", "data": "Listener failed"})
-                            return
-                        finally:
-                            # Reschedule the completed listener task
-                            if task in tasks:
-                                tasks.remove(task)
-                                if message and isinstance(message, dict) and message.get("channel") == response_channel:
-                                     tasks.append(asyncio.create_task(response_reader.__anext__()))
-                                elif message and isinstance(message, dict) and message.get("channel") == control_channel:
-                                     tasks.append(asyncio.create_task(control_reader.__anext__()))
-
-                # Cancel pending listener tasks on exit
-                for p_task in pending: p_task.cancel()
-                for task in tasks: task.cancel()
-
-
-            listener_task = asyncio.create_task(listen_messages())
-
-            # 4. Main loop to process messages from the queue
+            # 4. Main loop to process messages from the queue with timeout protection
             while not terminate_stream:
                 try:
-                    queue_item = await message_queue.get()
+                    # Use wait_for with timeout to prevent blocking forever
+                    queue_item = await asyncio.wait_for(message_queue.get(), timeout=0.5)
 
                     if queue_item["type"] == "new_response":
                         # Fetch new responses from Redis list starting after the last processed index
                         new_start_index = last_processed_index + 1
-                        new_responses_json = await redis.lrange(response_list_key, new_start_index, -1)
+                        try:
+                            new_responses_json = await asyncio.wait_for(
+                                redis.lrange(response_list_key, new_start_index, -1),
+                                timeout=1.0
+                            )
 
-                        if new_responses_json:
-                            new_responses = [json.loads(r) for r in new_responses_json]
-                            num_new = len(new_responses)
-                            # logger.debug(f"Received {num_new} new responses for {agent_run_id} (index {new_start_index} onwards)")
-                            for response in new_responses:
-                                yield f"data: {json.dumps(response)}\n\n"
-                                # Check if this response signals completion
-                                if response.get('type') == 'status' and response.get('status') in ['completed', 'failed', 'stopped']:
-                                    logger.info(f"Detected run completion via status message in stream: {response.get('status')}")
-                                    terminate_stream = True
-                                    break # Stop processing further new responses
-                            last_processed_index += num_new
-                        if terminate_stream: break
+                            if new_responses_json:
+                                new_responses = [json.loads(r) for r in new_responses_json]
+                                num_new = len(new_responses)
+                                for response in new_responses:
+                                    yield f"data: {json.dumps(response)}\n\n"
+                                    # Check if this response signals completion
+                                    if response.get('type') == 'status' and response.get('status') in ['completed', 'failed', 'stopped']:
+                                        logger.info(f"Detected run completion via status message in stream: {response.get('status')}")
+                                        terminate_stream = True
+                                        break # Stop processing further new responses
+                                last_processed_index += num_new
+                            if terminate_stream: break
+                        except asyncio.TimeoutError:
+                            logger.warning(f"Redis lrange timed out for {agent_run_id}")
+                            # Continue processing - don't terminate
 
                     elif queue_item["type"] == "control":
                         control_signal = queue_item["data"]
@@ -590,10 +852,13 @@ async def stream_agent_run(
                         yield f"data: {json.dumps({'type': 'status', 'status': 'error'})}\n\n"
                         break
 
+                except asyncio.TimeoutError:
+                    # No new messages in queue, just continue the loop
+                    await asyncio.sleep(0.01)  # Small sleep to prevent tight loop
                 except asyncio.CancelledError:
-                     logger.info(f"Stream generator main loop cancelled for {agent_run_id}")
-                     terminate_stream = True
-                     break
+                    logger.info(f"Stream generator main loop cancelled for {agent_run_id}")
+                    terminate_stream = True
+                    break
                 except Exception as loop_err:
                     logger.error(f"Error in stream generator main loop for {agent_run_id}: {loop_err}", exc_info=True)
                     terminate_stream = True
@@ -608,28 +873,45 @@ async def stream_agent_run(
         finally:
             terminate_stream = True
             # Graceful shutdown order: unsubscribe → close → cancel
-            if pubsub_response: await pubsub_response.unsubscribe(response_channel)
-            if pubsub_control: await pubsub_control.unsubscribe(control_channel)
-            if pubsub_response: await pubsub_response.close()
-            if pubsub_control: await pubsub_control.close()
+            try:
+                if pubsub_response: 
+                    await asyncio.wait_for(pubsub_response.unsubscribe(response_channel), timeout=1.0)
+                if pubsub_control: 
+                    await asyncio.wait_for(pubsub_control.unsubscribe(control_channel), timeout=1.0)
+                if pubsub_response: 
+                    await asyncio.wait_for(pubsub_response.close(), timeout=1.0)
+                if pubsub_control: 
+                    await asyncio.wait_for(pubsub_control.close(), timeout=1.0)
+            except (asyncio.TimeoutError, Exception) as e:
+                logger.warning(f"Error during pubsub cleanup: {e}")
 
             if listener_task:
                 listener_task.cancel()
                 try:
-                    await listener_task  # Reap inner tasks & swallow their errors
-                except asyncio.CancelledError:
+                    await asyncio.wait_for(listener_task, timeout=0.5)  # Short timeout for cancellation
+                except (asyncio.CancelledError, asyncio.TimeoutError, Exception):
                     pass
-                except Exception as e:
-                    logger.debug(f"listener_task ended with: {e}")
-            # Wait briefly for tasks to cancel
-            await asyncio.sleep(0.1)
+                    
             logger.debug(f"Streaming cleanup complete for agent run: {agent_run_id}")
+            
+            # Log total stream time
+            total_stream_time = time.time() - generator_start_time
+            logger.info(f"Total stream time for {agent_run_id}: {total_stream_time:.2f}s")
 
-    return StreamingResponse(stream_generator(), media_type="text/event-stream", headers={
-        "Cache-Control": "no-cache, no-transform", "Connection": "keep-alive",
-        "X-Accel-Buffering": "no", "Content-Type": "text/event-stream",
-        "Access-Control-Allow-Origin": "*"
-    })
+    # Set response headers to avoid buffering and optimize for streaming
+    return StreamingResponse(
+        stream_generator(), 
+        media_type="text/event-stream", 
+        headers={
+            "Cache-Control": "no-cache, no-transform", 
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no", 
+            "Content-Type": "text/event-stream",
+            "Access-Control-Allow-Origin": "*",
+            # Add additional headers to help with client rendering
+            "X-Stream-ID": agent_run_id
+        }
+    )
 
 async def generate_and_update_project_name(project_id: str, prompt: str):
     """Generates a project name using an LLM and updates the database."""
@@ -862,3 +1144,40 @@ async def initiate_agent_with_files(
         logger.error(f"Error in agent initiation: {str(e)}\n{traceback.format_exc()}")
         # TODO: Clean up created project/thread if initiation fails mid-way
         raise HTTPException(status_code=500, detail=f"Failed to initiate agent session: {str(e)}")
+
+@router.post("/agent-run/{agent_run_id}/stop")
+async def stop_agent(agent_run_id: str, user_id: str = Depends(get_current_user_id_from_jwt)):
+    """Stop a running agent."""
+    logger.info(f"Received request to stop agent run: {agent_run_id}")
+    client = await db.client
+    await get_agent_run_with_access_check(client, agent_run_id, user_id)
+    await stop_agent_run(agent_run_id)
+    return {"status": "stopped"}
+
+
+@router.get("/thread/{thread_id}/agent-runs")
+async def get_agent_runs(thread_id: str, user_id: str = Depends(get_current_user_id_from_jwt)):
+    """Get all agent runs for a thread."""
+    logger.info(f"Fetching agent runs for thread: {thread_id}")
+    client = await db.client
+    await verify_thread_access(client, thread_id, user_id)
+    agent_runs = await client.table('agent_runs').select('*').eq("thread_id", thread_id).order('created_at', desc=True).execute()
+    logger.debug(f"Found {len(agent_runs.data)} agent runs for thread: {thread_id}")
+    return {"agent_runs": agent_runs.data}
+
+
+@router.get("/agent-run/{agent_run_id}")
+async def get_agent_run(agent_run_id: str, user_id: str = Depends(get_current_user_id_from_jwt)):
+    """Get agent run status and responses."""
+    logger.info(f"Fetching agent run details: {agent_run_id}")
+    client = await db.client
+    agent_run_data = await get_agent_run_with_access_check(client, agent_run_id, user_id)
+    # Note: Responses are not included here by default, they are in the stream or DB
+    return {
+        "id": agent_run_data['id'],
+        "threadId": agent_run_data['thread_id'],
+        "status": agent_run_data['status'],
+        "startedAt": agent_run_data['started_at'],
+        "completedAt": agent_run_data['completed_at'],
+        "error": agent_run_data['error']
+    }
