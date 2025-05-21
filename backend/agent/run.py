@@ -16,7 +16,6 @@ from agentpress.thread_manager import ThreadManager
 from agentpress.response_processor import ProcessorConfig
 from agent.tools.sb_shell_tool import SandboxShellTool
 from agent.tools.sb_files_tool import SandboxFilesTool
-from agent.tools.sb_browser_tool import SandboxBrowserTool
 from agent.tools.data_providers_tool import DataProvidersTool
 from agent.prompt import get_system_prompt
 from utils.logger import logger
@@ -64,7 +63,14 @@ async def run_agent(
     # This ensures each tool independently verifies it's operating on the correct project
     thread_manager.add_tool(SandboxShellTool, project_id=project_id, thread_manager=thread_manager)
     thread_manager.add_tool(SandboxFilesTool, project_id=project_id, thread_manager=thread_manager)
-    thread_manager.add_tool(SandboxBrowserTool, project_id=project_id, thread_id=thread_id, thread_manager=thread_manager)
+    if config.ENABLE_BROWSER_TOOL:
+        from agent.tools.sb_browser_tool import SandboxBrowserTool
+        thread_manager.add_tool(
+            SandboxBrowserTool,
+            project_id=project_id,
+            thread_id=thread_id,
+            thread_manager=thread_manager,
+        )
     thread_manager.add_tool(SandboxDeployTool, project_id=project_id, thread_manager=thread_manager)
     thread_manager.add_tool(SandboxExposeTool, project_id=project_id, thread_manager=thread_manager)
     thread_manager.add_tool(MessageTool) # we are just doing this via prompt as there is no need to call it as a tool
@@ -116,46 +122,47 @@ async def run_agent(
         temporary_message = None
         temp_message_content_list = [] # List to hold text/image blocks
 
-        # Get the latest browser_state message
-        latest_browser_state_msg = await client.table('messages').select('*').eq('thread_id', thread_id).eq('type', 'browser_state').order('created_at', desc=True).limit(1).execute()
-        if latest_browser_state_msg.data and len(latest_browser_state_msg.data) > 0:
-            try:
-                browser_content = json.loads(latest_browser_state_msg.data[0]["content"])
-                screenshot_base64 = browser_content.get("screenshot_base64")
-                screenshot_url = browser_content.get("screenshot_url")
-                
-                # Create a copy of the browser state without screenshot data
-                browser_state_text = browser_content.copy()
-                browser_state_text.pop('screenshot_base64', None)
-                browser_state_text.pop('screenshot_url', None)
+        if config.ENABLE_BROWSER_TOOL:
+            # Get the latest browser_state message only when the browser tool is enabled
+            latest_browser_state_msg = await client.table('messages').select('*').eq('thread_id', thread_id).eq('type', 'browser_state').order('created_at', desc=True).limit(1).execute()
+            if latest_browser_state_msg.data and len(latest_browser_state_msg.data) > 0:
+                try:
+                    browser_content = json.loads(latest_browser_state_msg.data[0]["content"])
+                    screenshot_base64 = browser_content.get("screenshot_base64")
+                    screenshot_url = browser_content.get("screenshot_url")
 
-                if browser_state_text:
-                    temp_message_content_list.append({
-                        "type": "text",
-                        "text": f"The following is the current state of the browser:\n{json.dumps(browser_state_text, indent=2)}"
-                    })
-                    
-                # Prioritize screenshot_url if available
-                if screenshot_url:
-                    temp_message_content_list.append({
-                        "type": "image_url",
-                        "image_url": {
-                            "url": screenshot_url,
-                        }
-                    })
-                elif screenshot_base64:
-                    # Fallback to base64 if URL not available
-                    temp_message_content_list.append({
-                        "type": "image_url",
-                        "image_url": {
-                            "url": f"data:image/jpeg;base64,{screenshot_base64}",
-                        }
-                    })
-                else:
-                    logger.warning("Browser state found but no screenshot data.")
+                    # Create a copy of the browser state without screenshot data
+                    browser_state_text = browser_content.copy()
+                    browser_state_text.pop('screenshot_base64', None)
+                    browser_state_text.pop('screenshot_url', None)
 
-            except Exception as e:
-                logger.error(f"Error parsing browser state: {e}")
+                    if browser_state_text:
+                        temp_message_content_list.append({
+                            "type": "text",
+                            "text": f"The following is the current state of the browser:\n{json.dumps(browser_state_text, indent=2)}"
+                        })
+
+                    # Prioritize screenshot_url if available
+                    if screenshot_url:
+                        temp_message_content_list.append({
+                            "type": "image_url",
+                            "image_url": {
+                                "url": screenshot_url,
+                            }
+                        })
+                    elif screenshot_base64:
+                        # Fallback to base64 if URL not available
+                        temp_message_content_list.append({
+                            "type": "image_url",
+                            "image_url": {
+                                "url": f"data:image/jpeg;base64,{screenshot_base64}",
+                            }
+                        })
+                    else:
+                        logger.warning("Browser state found but no screenshot data.")
+
+                except Exception as e:
+                    logger.error(f"Error parsing browser state: {e}")
 
         # Get the latest image_context message (NEW)
         latest_image_context_msg = await client.table('messages').select('*').eq('thread_id', thread_id).eq('type', 'image_context').order('created_at', desc=True).limit(1).execute()

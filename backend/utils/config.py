@@ -161,6 +161,9 @@ class Configuration:
     # Sandbox configuration
     SANDBOX_IMAGE_NAME = "kortix/suna:0.1.2.8"
     SANDBOX_ENTRYPOINT = "/usr/bin/supervisord -n -c /etc/supervisor/conf.d/supervisord.conf"
+    # Toggle to enable or disable the browser tool. Disabling this tool can
+    # significantly reduce overhead when browser automation is not required.
+    ENABLE_BROWSER_TOOL: bool = True
 
     @property
     def STRIPE_PRODUCT_ID(self) -> str:

@@ -22,6 +22,7 @@ from services.billing import check_billing_status, can_use_model
 from utils.config import config
 from sandbox.sandbox import create_sandbox, get_or_start_sandbox
 from services.llm import make_llm_api_call
+from utils.profiling import profile
 from run_agent_background import run_agent_background, _cleanup_redis_response_list, update_agent_run_status
 
 # Initialize shared resources
@@ -316,7 +317,10 @@ async def add_llm_provider(request: AddProviderRequest, user_id: str = Depends(g
 
     return {"status": "success", "alias": alias, "model": model}
 
+from utils.profiling import profile
+
 @router.post("/thread/{thread_id}/agent/start")
+@profile
 async def start_agent(
     thread_id: str,
     body: AgentStartRequest = Body(...),
@@ -670,6 +674,7 @@ async def generate_and_update_project_name(project_id: str, prompt: str):
         logger.info(f"Finished background naming task for project: {project_id}")
 
 @router.post("/agent/initiate", response_model=InitiateAgentResponse)
+@profile
 async def initiate_agent_with_files(
     prompt: str = Form(...),
     model_name: Optional[str] = Form(None),  # Default to None to use config.MODEL_TO_USE
