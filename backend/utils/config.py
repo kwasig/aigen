@@ -163,7 +163,7 @@ class Configuration:
     SANDBOX_ENTRYPOINT = "/usr/bin/supervisord -n -c /etc/supervisor/conf.d/supervisord.conf"
     # Toggle to enable or disable the browser tool. Disabling this tool can
     # significantly reduce overhead when browser automation is not required.
-    ENABLE_BROWSER_TOOL: bool = True
+    ENABLE_BROWSER_TOOL: bool = False
 
     @property
     def STRIPE_PRODUCT_ID(self) -> str:
