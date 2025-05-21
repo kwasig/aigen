@@ -12,7 +12,13 @@ from utils.logger import logger
 import uuid
 import time
 from collections import OrderedDict
-from prometheus_client import Counter, Histogram, generate_latest, CONTENT_TYPE_LATEST
+from prometheus_client import (
+    Counter,
+    Histogram,
+    CollectorRegistry,
+    generate_latest,
+    CONTENT_TYPE_LATEST,
+)
 
 # Import the agent API module
 from agent import api as agent_api
@@ -28,15 +34,20 @@ thread_manager = None
 instance_id = "single"
 
 # Prometheus metrics for observability
+# Use a dedicated registry to avoid duplicate metric registration when the app
+# is loaded multiple times (e.g. in multiprocessing scenarios).
+METRICS_REGISTRY = CollectorRegistry()
 REQUEST_COUNT = Counter(
     "api_request_total",
     "Total API requests",
     ["method", "endpoint", "http_status"],
+    registry=METRICS_REGISTRY,
 )
 REQUEST_LATENCY = Histogram(
     "api_request_latency_seconds",
     "API request latency",
     ["method", "endpoint"],
+    registry=METRICS_REGISTRY,
 )
 
 # Rate limiter state
@@ -166,7 +177,7 @@ async def health_check():
 @app.get("/metrics")
 async def metrics():
     """Expose Prometheus metrics."""
-    data = generate_latest()
+    data = generate_latest(METRICS_REGISTRY)
     return Response(content=data, media_type=CONTENT_TYPE_LATEST)
 
 if __name__ == "__main__":
