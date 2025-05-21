@@ -12,13 +12,8 @@ from utils.logger import logger
 import uuid
 import time
 from collections import OrderedDict
-from prometheus_client import (
-    Counter,
-    Histogram,
-    CollectorRegistry,
-    generate_latest,
-    CONTENT_TYPE_LATEST,
-)
+from prometheus_client import generate_latest, CONTENT_TYPE_LATEST
+from utils.metrics import REQUEST_COUNT, REQUEST_LATENCY, registry as METRICS_REGISTRY
 
 # Import the agent API module
 from agent import api as agent_api

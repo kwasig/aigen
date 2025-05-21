@@ -38,7 +38,8 @@ Suna consists of four main components:
 
 ### Backend API
 
-Python/FastAPI service that handles REST endpoints, thread management, and LLM integration with Anthropic and others via LiteLLM. It also exposes a `/metrics` endpoint for Prometheus scraping.
+Python/FastAPI service that handles REST endpoints, thread management, and LLM integration with Anthropic, and others via LiteLLM.
+Prometheus metrics are exposed at `/metrics` for observability.
 
 ### Frontend
 
