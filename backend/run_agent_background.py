@@ -13,6 +13,7 @@ from services.supabase import DBConnection
 from services import redis
 from dramatiq.brokers.rabbitmq import RabbitmqBroker
 import os
+from utils.profiling import profile
 
 rabbitmq_host = os.getenv('RABBITMQ_HOST', 'rabbitmq')
 rabbitmq_port = int(os.getenv('RABBITMQ_PORT', 5672))
@@ -43,6 +44,7 @@ async def initialize():
 
 
 @dramatiq.actor
+@profile
 async def run_agent_background(
     agent_run_id: str,
     thread_id: str,

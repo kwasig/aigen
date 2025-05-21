@@ -1,6 +1,6 @@
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 from contextlib import asynccontextmanager
 from agentpress.thread_manager import ThreadManager
 from services.supabase import DBConnection
@@ -12,6 +12,13 @@ from utils.logger import logger
 import uuid
 import time
 from collections import OrderedDict
+from prometheus_client import (
+    Counter,
+    Histogram,
+    CollectorRegistry,
+    generate_latest,
+    CONTENT_TYPE_LATEST,
+)
 
 # Import the agent API module
 from agent import api as agent_api
@@ -25,6 +32,23 @@ load_dotenv()
 db = DBConnection()
 thread_manager = None
 instance_id = "single"
+
+# Prometheus metrics for observability
+# Use a dedicated registry to avoid duplicate metric registration when the app
+# is loaded multiple times (e.g. in multiprocessing scenarios).
+METRICS_REGISTRY = CollectorRegistry()
+REQUEST_COUNT = Counter(
+    "api_request_total",
+    "Total API requests",
+    ["method", "endpoint", "http_status"],
+    registry=METRICS_REGISTRY,
+)
+REQUEST_LATENCY = Histogram(
+    "api_request_latency_seconds",
+    "API request latency",
+    ["method", "endpoint"],
+    registry=METRICS_REGISTRY,
+)
 
 # Rate limiter state
 ip_tracker = OrderedDict()
@@ -97,14 +121,18 @@ async def log_requests_middleware(request: Request, call_next):
     
     # Log the incoming request
     logger.info(f"Request started: {method} {path} from {client_ip} | Query: {query_params}")
-    
+
     try:
         response = await call_next(request)
         process_time = time.time() - start_time
+        REQUEST_LATENCY.labels(method, path).observe(process_time)
+        REQUEST_COUNT.labels(method, path, response.status_code).inc()
         logger.debug(f"Request completed: {method} {path} | Status: {response.status_code} | Time: {process_time:.2f}s")
         return response
     except Exception as e:
         process_time = time.time() - start_time
+        REQUEST_LATENCY.labels(method, path).observe(process_time)
+        REQUEST_COUNT.labels(method, path, 500).inc()
         logger.error(f"Request failed: {method} {path} | Error: {str(e)} | Time: {process_time:.2f}s")
         raise
 
@@ -145,6 +173,12 @@ async def health_check():
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "instance_id": instance_id
     }
+
+@app.get("/metrics")
+async def metrics():
+    """Expose Prometheus metrics."""
+    data = generate_latest(METRICS_REGISTRY)
+    return Response(content=data, media_type=CONTENT_TYPE_LATEST)
 
 if __name__ == "__main__":
     import uvicorn
