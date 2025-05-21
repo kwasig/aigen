@@ -1,3 +1,4 @@
 {
-  "maverick": "sambanova/Llama-4-Maverick-17B-128E-Instruct"
+  "maverick": "sambanova/Llama-4-Maverick-17B-128E-Instruct",
+  "deepseek0324": "sambanova/DeepSeek-V3-0324"
 }
