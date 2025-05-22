@@ -549,32 +549,38 @@ export function useAgentStream(
       currentRunIdRef.current = runId; // Set the ref immediately
 
       try {
-        // *** Crucial check: Verify agent is running BEFORE connecting ***
-        const agentStatus = await getAgentStatus(runId);
-        if (!isMountedRef.current) return; // Check mount status after async call
-
-        if (agentStatus.status !== 'running') {
-          console.warn(
-            `[useAgentStream] Agent run ${runId} is not in running state (status: ${agentStatus.status}). Cannot start stream.`,
-          );
-          setError(`Agent run is not running (status: ${agentStatus.status})`);
-          finalizeStream(
-            mapAgentStatus(agentStatus.status) || 'agent_not_running',
-            runId,
-          );
-          return;
-        }
-
-        // Agent is running, proceed to create the stream
-        console.log(
-          `[useAgentStream] Agent run ${runId} confirmed running. Setting up EventSource.`,
-        );
+        // Start streaming immediately for lower perceived latency
         const cleanup = streamAgent(runId, {
           onMessage: handleStreamMessage,
           onError: handleStreamError,
           onClose: handleStreamClose,
         });
         streamCleanupRef.current = cleanup;
+
+        // Concurrently check agent status to surface errors early without blocking
+        getAgentStatus(runId)
+          .then((agentStatus) => {
+            if (!isMountedRef.current) return;
+            if (agentStatus.status !== 'running') {
+              console.warn(
+                `[useAgentStream] Agent run ${runId} is not running (status: ${agentStatus.status}).`,
+              );
+              setError(`Agent run is not running (status: ${agentStatus.status})`);
+              finalizeStream(
+                mapAgentStatus(agentStatus.status) || 'agent_not_running',
+                runId,
+              );
+            }
+          })
+          .catch((statusErr) => {
+            if (!isMountedRef.current) return;
+            const errMsg = statusErr instanceof Error ? statusErr.message : String(statusErr);
+            console.error(
+              `[useAgentStream] Error fetching status for ${runId}: ${errMsg}`,
+            );
+            setError(errMsg);
+            finalizeStream('error', runId);
+          });
         // Status will be updated to 'streaming' by the first message received in handleStreamMessage
       } catch (err) {
         if (!isMountedRef.current) return; // Check mount status after async call
