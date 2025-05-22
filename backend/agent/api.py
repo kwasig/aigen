@@ -540,43 +540,55 @@ async def stream_agent_run(
     """Stream the responses of an agent run using Redis Lists and Pub/Sub."""
     stream_start_time = time.time()
     logger.info(f"Starting stream for agent run: {agent_run_id}")
-    client = await db.client
-
-    # Get user auth in parallel with Redis prep to reduce latency
-    auth_task = asyncio.create_task(get_user_id_from_stream_auth(request, token))
+    
+    # Get DB and Redis clients in parallel
+    client_task = asyncio.create_task(db.client)
+    redis_client_task = asyncio.create_task(redis.get_client())
 
     # Prepare Redis keys/channels in advance
     response_list_key = f"agent_run:{agent_run_id}:responses"
     response_channel = f"agent_run:{agent_run_id}:new_response"
     control_channel = f"agent_run:{agent_run_id}:control" # Global control channel
-
-    # Prepare Redis connection for faster access - with 1 second timeout
-    try:
-        redis_client = await asyncio.wait_for(redis.get_client(), timeout=1.0)
-    except asyncio.TimeoutError:
-        logger.warning(f"Redis client timeout for agent run {agent_run_id}, proceeding with defaults")
-        redis_client = None
     
-    # Define helper function to set up pubsub channels
-    async def setup_pubsub_channels():
-        psr = await redis.create_pubsub()
-        await psr.subscribe(response_channel)
-        
-        psc = await redis.create_pubsub()
-        await psc.subscribe(control_channel)
-        
-        return psr, psc
+    # Start auth check in parallel too
+    auth_task = asyncio.create_task(get_user_id_from_stream_auth(request, token))
     
-    # Now get the auth result
+    # Wait for all tasks with a timeout to prevent blocking
     try:
-        # Use a shorter timeout for auth check to improve responsiveness
-        user_id = await asyncio.wait_for(auth_task, timeout=1.0)
-    except asyncio.TimeoutError:
-        logger.warning(f"Auth timeout for agent run {agent_run_id}, treating as unauthenticated")
-        raise HTTPException(status_code=401, detail="Authentication timed out")
+        done, pending = await asyncio.wait(
+            [client_task, redis_client_task, auth_task],
+            timeout=1.0,  # Short timeout for faster response
+            return_when=asyncio.ALL_COMPLETED
+        )
+        
+        # Process completed tasks
+        client = None
+        user_id = None
+        
+        for task in done:
+            if task == client_task and not task.exception():
+                client = task.result()
+            elif task == auth_task and not task.exception():
+                user_id = task.result()
+        
+        # Cancel any pending tasks
+        for task in pending:
+            task.cancel()
+            
+        # Handle missing results
+        if client is None:
+            client = await db.client  # Fallback if the parallel task failed
+            
+        if user_id is None:
+            # Auth failed or timed out
+            logger.warning(f"Auth timeout for agent run {agent_run_id}, treating as unauthenticated")
+            raise HTTPException(status_code=401, detail="Authentication timed out")
+            
     except Exception as e:
-        logger.error(f"Auth error: {e}")
-        raise HTTPException(status_code=401, detail="Authentication failed")
+        logger.error(f"Error in parallel initialization: {e}")
+        # Fallback to sequential initialization
+        client = await db.client
+        user_id = await get_user_id_from_stream_auth(request, token)
     
     # Check if the user has access to this agent run
     try:
@@ -594,6 +606,16 @@ async def stream_agent_run(
         logger.error(f"Error getting agent run: {e}")
         raise HTTPException(status_code=500, detail=f"Error accessing agent run: {str(e)}")
 
+    # Define helper function to set up pubsub channels
+    async def setup_pubsub_channels():
+        psr = await redis.create_pubsub()
+        await psr.subscribe(response_channel)
+        
+        psc = await redis.create_pubsub()
+        await psc.subscribe(control_channel)
+        
+        return psr, psc
+
     # Log performance metric for initial request processing
     initial_process_time = time.time() - stream_start_time
     logger.info(f"Initial stream setup completed in {initial_process_time:.2f}s, starting stream generation")
@@ -607,6 +629,35 @@ async def stream_agent_run(
         terminate_stream = False
         initial_yield_complete = False
         generator_start_time = time.time()
+        message_queue = asyncio.Queue()
+
+        # Define the polling function first before using it
+        async def poll_for_new_responses(interval):
+            """Fallback polling mechanism when pubsub isn't available."""
+            logger.info(f"Starting polling fallback for {agent_run_id} with interval {interval}s")
+            last_check_time = time.time()
+            # Initial poll immediately
+            await message_queue.put({"type": "new_response"})
+            
+            while not terminate_stream:
+                try:
+                    # Check Redis directly - use a shorter interval for better responsiveness
+                    await asyncio.sleep(interval * 0.5)  # Poll more frequently
+                    await message_queue.put({"type": "new_response"})
+                    
+                    # Also check run status periodically (every 5 polling intervals)
+                    current_time = time.time()
+                    if current_time - last_check_time > interval * 3:  # Check status more frequently
+                        last_check_time = current_time
+                        status_result = await client.table('agent_runs').select('status').eq("id", agent_run_id).maybe_single().execute()
+                        if status_result.data:
+                            status = status_result.data.get('status')
+                            if status in ['completed', 'failed', 'stopped']:
+                                await message_queue.put({"type": "control", "data": status.upper()})
+                                return  # Stop polling
+                except Exception as e:
+                    logger.error(f"Error in polling fallback: {e}")
+                    await asyncio.sleep(interval * 2)  # Back off on error
 
         try:
             # 1. Immediately yield an initial status message to reduce perceived latency
@@ -668,7 +719,7 @@ async def stream_agent_run(
             try:
                 done, pending = await asyncio.wait(
                     [status_check_task, pubsub_setup_task],
-                    timeout=2.0,
+                    timeout=1.0,  # Reduced timeout for better responsiveness
                     return_when=asyncio.ALL_COMPLETED
                 )
                 # Cancel any pending tasks
@@ -696,12 +747,12 @@ async def stream_agent_run(
                 logger.warning(f"Error setting up status check or pubsub: {e}")
                 # Continue anyway to show existing messages
             
-            # If pubsub setup failed, try again
+            # If pubsub setup failed, try again with shorter timeout
             if pubsub_response is None or pubsub_control is None:
                 try:
                     pubsub_response, pubsub_control = await asyncio.wait_for(
                         setup_pubsub_channels(),
-                        timeout=2.0
+                        timeout=1.0  # Faster timeout for better responsiveness
                     )
                 except Exception as e:
                     logger.warning(f"Second pubsub setup attempt failed: {e}")
@@ -782,33 +833,6 @@ async def stream_agent_run(
                 polling_interval = 0.5  # seconds
                 asyncio.create_task(poll_for_new_responses(polling_interval))
                 
-            async def poll_for_new_responses(interval):
-                """Fallback polling mechanism when pubsub isn't available."""
-                logger.info(f"Starting polling fallback for {agent_run_id} with interval {interval}s")
-                last_check_time = time.time()
-                # Initial poll immediately
-                await message_queue.put({"type": "new_response"})
-                
-                while not terminate_stream:
-                    try:
-                        # Check Redis directly - use a shorter interval for better responsiveness
-                        await asyncio.sleep(interval * 0.5)  # Poll more frequently
-                        await message_queue.put({"type": "new_response"})
-                        
-                        # Also check run status periodically (every 5 polling intervals)
-                        current_time = time.time()
-                        if current_time - last_check_time > interval * 3:  # Check status more frequently
-                            last_check_time = current_time
-                            status_result = await client.table('agent_runs').select('status').eq("id", agent_run_id).maybe_single().execute()
-                            if status_result.data:
-                                status = status_result.data.get('status')
-                                if status in ['completed', 'failed', 'stopped']:
-                                    await message_queue.put({"type": "control", "data": status.upper()})
-                                    return  # Stop polling
-                    except Exception as e:
-                        logger.error(f"Error in polling fallback: {e}")
-                        await asyncio.sleep(interval * 2)  # Back off on error
-
             # 4. Main loop to process messages from the queue with timeout protection
             while not terminate_stream:
                 try:

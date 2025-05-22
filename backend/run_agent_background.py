@@ -127,7 +127,11 @@ async def run_agent_background(
         # Create ThreadManager
         thread_manager = ThreadManager()
         
-        # Run the agent
+        # Create Redis keys
+        response_list_key = f"agent_run:{agent_run_id}:responses"
+        response_channel = f"agent_run:{agent_run_id}:new_response"
+        
+        # Run the agent and stream responses to Redis
         agent_responses = []
         async for response in run_agent(
             thread_id=thread_id,
@@ -140,6 +144,12 @@ async def run_agent_background(
             enable_context_manager=enable_context_manager
         ):
             agent_responses.append(response)
+            # Push to Redis for the SSE stream
+            try:
+                await redis.rpush(response_list_key, json.dumps(response))
+                await redis.publish(response_channel, "new")
+            except Exception as e:
+                logger.warning(f"Failed to push response to Redis for {agent_run_id}: {e}")
             
         # Determine success based on final response
         agent_success = True

@@ -257,15 +257,8 @@ async def publish(channel: str, message: str):
 
 
 async def create_pubsub():
-    """Create a Redis pubsub object with caching."""
-    # Try to get a cached pubsub client
-    cache_key = f"pubsub_{id(asyncio.current_task())}"
-    
-    if cache_key in _client_cache:
-        logger.debug(f"Using cached pubsub connection {cache_key}")
-        return _client_cache[cache_key]
-    
-    # Get fresh Redis client
+    """Create a Redis pubsub object without caching to avoid shared connection conflicts."""
+    # Always create a fresh pubsub connection to avoid concurrent read issues
     redis_client = await get_client()
     if not redis_client:
         # Return a dummy pubsub object that does nothing
@@ -273,10 +266,9 @@ async def create_pubsub():
         dummy = AsyncMock()
         logger.warning("Creating dummy pubsub object since Redis is not available")
         return dummy
-        
-    # Create new pubsub and cache it
+    
+    # Create new pubsub connection
     pubsub = redis_client.pubsub()
-    _client_cache[cache_key] = pubsub
     return pubsub
 
 
