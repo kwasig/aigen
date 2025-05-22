@@ -3,6 +3,12 @@ from typing import Optional, Dict, Tuple
 import time
 import jwt
 from jwt.exceptions import PyJWTError
+import time
+
+# Simple in-memory cache to avoid repeated DB checks for the same
+# thread/user combination. Each entry expires after a short TTL.
+_thread_access_cache = {}
+THREAD_ACCESS_TTL = 30  # seconds
 
 # Simple in-memory cache for thread access checks
 _thread_access_cache: Dict[Tuple[str, str], float] = {}
