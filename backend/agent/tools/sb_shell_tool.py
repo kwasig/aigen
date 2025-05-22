@@ -1,5 +1,6 @@
 from typing import Optional, Dict, Any
 import time
+import asyncio
 from uuid import uuid4
 from agentpress.tool import ToolResult, openapi_schema, xml_schema
 from sandbox.tool_base import SandboxToolsBase
@@ -20,7 +21,7 @@ class SandboxShellTool(SandboxToolsBase):
             session_id = str(uuid4())
             try:
                 await self._ensure_sandbox()  # Ensure sandbox is initialized
-                self.sandbox.process.create_session(session_id)
+                await asyncio.to_thread(self.sandbox.process.create_session, session_id)
                 self._sessions[session_name] = session_id
             except Exception as e:
                 raise RuntimeError(f"Failed to create session: {str(e)}")
@@ -31,7 +32,7 @@ class SandboxShellTool(SandboxToolsBase):
         if session_name in self._sessions:
             try:
                 await self._ensure_sandbox()  # Ensure sandbox is initialized
-                self.sandbox.process.delete_session(self._sessions[session_name])
+                await asyncio.to_thread(self.sandbox.process.delete_session, self._sessions[session_name])
                 del self._sessions[session_name]
             except Exception as e:
                 print(f"Warning: Failed to cleanup session {session_name}: {str(e)}")
@@ -145,8 +146,8 @@ class SandboxShellTool(SandboxToolsBase):
                 # For blocking execution, wait and capture output
                 start_time = time.time()
                 while (time.time() - start_time) < timeout:
-                    # Wait a bit before checking
-                    time.sleep(2)
+                    # Wait a bit before checking without blocking the event loop
+                    await asyncio.sleep(2)
                     
                     # Check if session still exists (command might have exited)
                     check_result = await self._execute_raw_command(f"tmux has-session -t {session_name} 2>/dev/null || echo 'ended'")
@@ -207,13 +208,15 @@ class SandboxShellTool(SandboxToolsBase):
             cwd=self.workspace_path
         )
         
-        response = self.sandbox.process.execute_session_command(
+        response = await asyncio.to_thread(
+            self.sandbox.process.execute_session_command,
             session_id=session_id,
             req=req,
             timeout=30  # Short timeout for utility commands
         )
-        
-        logs = self.sandbox.process.get_session_command_logs(
+
+        logs = await asyncio.to_thread(
+            self.sandbox.process.get_session_command_logs,
             session_id=session_id,
             command_id=response.cmd_id
         )

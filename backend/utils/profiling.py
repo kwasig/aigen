@@ -1,3 +1,4 @@
+import os
 import cProfile
 import pstats
 import io
@@ -5,9 +6,20 @@ import asyncio
 from functools import wraps
 from utils.logger import logger
 
+# Allow profiling to be toggled via an environment variable. This lets us avoid
+# the heavy overhead of cProfile in production where every request was being
+# profiled, leading to noticeable latency. Profiling can be enabled by setting
+# `ENABLE_PROFILING=1` in the environment.
+ENABLE_PROFILING = os.getenv("ENABLE_PROFILING", "0") in {"1", "true", "True"}
+
 
 def profile(func):
     """Decorator to profile a function and log the top cumulative results."""
+
+    # If profiling is disabled, simply return the original function to avoid
+    # any overhead.
+    if not ENABLE_PROFILING:
+        return func
 
     if asyncio.iscoroutinefunction(func):
         @wraps(func)
