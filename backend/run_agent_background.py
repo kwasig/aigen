@@ -91,7 +91,7 @@ async def run_agent_background(
         try:
             done, pending = await asyncio.wait(
                 [redis_task, db_task], 
-                timeout=2.0,  # Reduced timeout for faster startup
+                timeout=1.0,  # Reduced timeout for faster startup
                 return_when=asyncio.ALL_COMPLETED
             )
             

@@ -22,6 +22,7 @@ from utils.logger import logger
 from services.billing import check_billing_status, can_use_model
 from utils.config import config
 from sandbox.sandbox import create_sandbox, get_or_start_sandbox
+import asyncio
 from services.llm import make_llm_api_call
 from utils.profiling import profile
 from run_agent_background import run_agent_background, _cleanup_redis_response_list, update_agent_run_status
@@ -1100,20 +1101,10 @@ async def initiate_agent_with_files(
                             logger.error(f"Error during sandbox upload call for {safe_filename}: {str(upload_error)}", exc_info=True)
 
                         if upload_successful:
-                            try:
-                                await asyncio.sleep(0.2)
-                                parent_dir = os.path.dirname(target_path)
-                                files_in_dir = sandbox.fs.list_files(parent_dir)
-                                file_names_in_dir = [f.name for f in files_in_dir]
-                                if safe_filename in file_names_in_dir:
-                                    successful_uploads.append(target_path)
-                                    logger.info(f"Successfully uploaded and verified file {safe_filename} to sandbox path {target_path}")
-                                else:
-                                    logger.error(f"Verification failed for {safe_filename}: File not found in {parent_dir} after upload attempt.")
-                                    failed_uploads.append(safe_filename)
-                            except Exception as verify_error:
-                                logger.error(f"Error verifying file {safe_filename} after upload: {str(verify_error)}", exc_info=True)
-                                failed_uploads.append(safe_filename)
+                            successful_uploads.append(target_path)
+                            logger.info(
+                                f"Successfully uploaded file {safe_filename} to sandbox path {target_path}"
+                            )
                         else:
                             failed_uploads.append(safe_filename)
                     except Exception as file_error:
