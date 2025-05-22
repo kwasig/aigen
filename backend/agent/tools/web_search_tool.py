@@ -247,24 +247,28 @@ class SandboxWebSearchTool(SandboxToolsBase):
             
             logging.info(f"Processing {len(url_list)} URLs: {url_list}")
             
-            # Process each URL concurrently for faster results
-            async def scrape_task(target_url: str):
-                try:
-                    # Add protocol if missing
-                    if not (target_url.startswith('http://') or target_url.startswith('https://')):
-                        target_url = 'https://' + target_url
-                        logging.info(f"Added https:// protocol to URL: {target_url}")
+            # Process URLs concurrently for better performance
+            tasks = []
+            for url in url_list:
+                # Add protocol if missing
+                if not (url.startswith('http://') or url.startswith('https://')):
+                    url = 'https://' + url
+                    logging.info(f"Added https:// protocol to URL: {url}")
 
-                    return await self._scrape_single_url(target_url)
-                except Exception as e:
-                    logging.error(f"Error processing URL {target_url}: {str(e)}")
-                    return {
-                        "url": target_url,
+                tasks.append(self._scrape_single_url(url))
+
+            results = []
+            responses = await asyncio.gather(*tasks, return_exceptions=True)
+            for url, resp in zip(url_list, responses):
+                if isinstance(resp, Exception):
+                    logging.error(f"Error processing URL {url}: {str(resp)}")
+                    results.append({
+                        "url": url,
                         "success": False,
-                        "error": str(e)
-                    }
-
-            results = await asyncio.gather(*(scrape_task(u) for u in url_list))
+                        "error": str(resp)
+                    })
+                else:
+                    results.append(resp)
             
             # Summarize results
             successful = sum(1 for r in results if r.get("success", False))

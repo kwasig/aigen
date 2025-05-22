@@ -1,5 +1,6 @@
 from fastapi import HTTPException, Request
-from typing import Optional
+from typing import Optional, Dict, Tuple
+import time
 import jwt
 from jwt.exceptions import PyJWTError
 import time
@@ -8,6 +9,10 @@ import time
 # thread/user combination. Each entry expires after a short TTL.
 _thread_access_cache = {}
 THREAD_ACCESS_TTL = 30  # seconds
+
+# Simple in-memory cache for thread access checks
+_thread_access_cache: Dict[Tuple[str, str], float] = {}
+_THREAD_ACCESS_CACHE_TTL = 30  # seconds
 
 # This function extracts the user ID from Supabase JWT
 async def get_current_user_id_from_jwt(request: Request) -> str:
@@ -165,9 +170,10 @@ async def verify_thread_access(client, thread_id: str, user_id: str):
     Raises:
         HTTPException: If the user doesn't have access to the thread
     """
-    cache_key = f"{thread_id}:{user_id}"
-    cached = _thread_access_cache.get(cache_key)
-    if cached and (time.time() - cached) < THREAD_ACCESS_TTL:
+    # Check cache first to avoid repeated database queries
+    cache_key = (user_id, thread_id)
+    expiry = _thread_access_cache.get(cache_key)
+    if expiry and expiry > time.time():
         return True
 
     # Query the thread to get account information
@@ -184,7 +190,7 @@ async def verify_thread_access(client, thread_id: str, user_id: str):
         project_result = await client.table('projects').select('is_public').eq('project_id', project_id).execute()
         if project_result.data and len(project_result.data) > 0:
             if project_result.data[0].get('is_public'):
-                _thread_access_cache[cache_key] = time.time()
+                _thread_access_cache[cache_key] = time.time() + _THREAD_ACCESS_CACHE_TTL
                 return True
         
     account_id = thread_data.get('account_id')
@@ -192,7 +198,7 @@ async def verify_thread_access(client, thread_id: str, user_id: str):
     if account_id:
         account_user_result = await client.schema('basejump').from_('account_user').select('account_role').eq('user_id', user_id).eq('account_id', account_id).execute()
         if account_user_result.data and len(account_user_result.data) > 0:
-            _thread_access_cache[cache_key] = time.time()
+            _thread_access_cache[cache_key] = time.time() + _THREAD_ACCESS_CACHE_TTL
             return True
     raise HTTPException(status_code=403, detail="Not authorized to access this thread")
 

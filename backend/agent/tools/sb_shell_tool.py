@@ -146,7 +146,7 @@ class SandboxShellTool(SandboxToolsBase):
                 # For blocking execution, wait and capture output
                 start_time = time.time()
                 while (time.time() - start_time) < timeout:
-                    # Wait a bit before checking
+                    # Wait a bit before checking without blocking the event loop
                     await asyncio.sleep(2)
                     
                     # Check if session still exists (command might have exited)
