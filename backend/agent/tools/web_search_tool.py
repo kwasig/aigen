@@ -247,26 +247,24 @@ class SandboxWebSearchTool(SandboxToolsBase):
             
             logging.info(f"Processing {len(url_list)} URLs: {url_list}")
             
-            # Process each URL and collect results
-            results = []
-            for url in url_list:
+            # Process each URL concurrently for faster results
+            async def scrape_task(target_url: str):
                 try:
                     # Add protocol if missing
-                    if not (url.startswith('http://') or url.startswith('https://')):
-                        url = 'https://' + url
-                        logging.info(f"Added https:// protocol to URL: {url}")
-                    
-                    # Scrape this URL
-                    result = await self._scrape_single_url(url)
-                    results.append(result)
-                    
+                    if not (target_url.startswith('http://') or target_url.startswith('https://')):
+                        target_url = 'https://' + target_url
+                        logging.info(f"Added https:// protocol to URL: {target_url}")
+
+                    return await self._scrape_single_url(target_url)
                 except Exception as e:
-                    logging.error(f"Error processing URL {url}: {str(e)}")
-                    results.append({
-                        "url": url,
+                    logging.error(f"Error processing URL {target_url}: {str(e)}")
+                    return {
+                        "url": target_url,
                         "success": False,
                         "error": str(e)
-                    })
+                    }
+
+            results = await asyncio.gather(*(scrape_task(u) for u in url_list))
             
             # Summarize results
             successful = sum(1 for r in results if r.get("success", False))
