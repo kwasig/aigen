@@ -5,6 +5,7 @@ from uuid import uuid4
 from agentpress.tool import ToolResult, openapi_schema, xml_schema
 from sandbox.tool_base import SandboxToolsBase
 from agentpress.thread_manager import ThreadManager
+from utils.config import config
 
 class SandboxShellTool(SandboxToolsBase):
     """Tool for executing tasks in a Daytona sandbox with browser-use capabilities. 
@@ -146,8 +147,8 @@ class SandboxShellTool(SandboxToolsBase):
                 # For blocking execution, wait and capture output
                 start_time = time.time()
                 while (time.time() - start_time) < timeout:
-                    # Wait a bit before checking without blocking the event loop
-                    await asyncio.sleep(2)
+                    # Wait briefly before polling again
+                    await asyncio.sleep(0.5)
                     
                     # Check if session still exists (command might have exited)
                     check_result = await self._execute_raw_command(f"tmux has-session -t {session_name} 2>/dev/null || echo 'ended'")
@@ -212,7 +213,7 @@ class SandboxShellTool(SandboxToolsBase):
             self.sandbox.process.execute_session_command,
             session_id=session_id,
             req=req,
-            timeout=30  # Short timeout for utility commands
+            timeout=config.SANDBOX_DEFAULT_TIMEOUT  # Configurable timeout
         )
 
         logs = await asyncio.to_thread(

@@ -10,8 +10,43 @@ import os
 import datetime
 import asyncio
 import logging
+import time
+from collections import OrderedDict
+
+
+class _TTLCache:
+    """A simple TTL-based LRU cache for storing search results."""
+
+    def __init__(self, maxsize: int = 50, ttl: int = 600):
+        self.maxsize = maxsize
+        self.ttl = ttl
+        self._store = OrderedDict()
+        self._lock = asyncio.Lock()
+
+    async def get(self, key: str):
+        async with self._lock:
+            item = self._store.get(key)
+            if item is None:
+                return None
+            value, timestamp = item
+            if time.time() - timestamp > self.ttl:
+                del self._store[key]
+                return None
+            self._store.move_to_end(key)
+            return value
+
+    async def set(self, key: str, value):
+        async with self._lock:
+            if key in self._store:
+                self._store.move_to_end(key)
+            self._store[key] = (value, time.time())
+            if len(self._store) > self.maxsize:
+                self._store.popitem(last=False)
 
 # TODO: add subpages, etc... in filters as sometimes its necessary 
+
+_search_cache = _TTLCache()
+
 
 class SandboxWebSearchTool(SandboxToolsBase):
     """Tool for performing web searches using Tavily API and web scraping using Firecrawl."""
@@ -115,15 +150,23 @@ class SandboxWebSearchTool(SandboxToolsBase):
             else:
                 num_results = 20
 
-            # Execute the search with Tavily
-            logging.info(f"Executing web search for query: '{query}' with {num_results} results")
-            search_response = await self.tavily_client.search(
-                query=query,
-                max_results=num_results,
-                include_images=True,
-                include_answer="advanced",
-                search_depth="advanced",
-            )
+            cache_key = f"{query}|{num_results}"
+            cached = await _search_cache.get(cache_key)
+            if cached is not None:
+                logging.info("Returning cached web search result")
+                search_response = cached
+            else:
+                logging.info(
+                    f"Executing web search for query: '{query}' with {num_results} results"
+                )
+                search_response = await self.tavily_client.search(
+                    query=query,
+                    max_results=num_results,
+                    include_images=True,
+                    include_answer="advanced",
+                    search_depth="advanced",
+                )
+                await _search_cache.set(cache_key, search_response)
             
             # Return the complete Tavily response 
             # This includes the query, answer, results, images and more

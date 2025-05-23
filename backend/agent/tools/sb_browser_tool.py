@@ -6,6 +6,7 @@ from agentpress.thread_manager import ThreadManager
 from sandbox.tool_base import SandboxToolsBase
 from utils.logger import logger
 from utils.s3_upload_utils import upload_base64_image
+from utils.config import config
 
 
 class SandboxBrowserTool(SandboxToolsBase):
@@ -46,7 +47,9 @@ class SandboxBrowserTool(SandboxToolsBase):
             logger.debug("\033[95mExecuting curl command:\033[0m")
             logger.debug(f"{curl_cmd}")
             
-            response = self.sandbox.process.exec(curl_cmd, timeout=30)
+            response = self.sandbox.process.exec(
+                curl_cmd, timeout=config.SANDBOX_DEFAULT_TIMEOUT
+            )
             
             if response.exit_code == 0:
                 try:
