@@ -72,6 +72,11 @@ class SandboxShellTool(SandboxToolsBase):
                             "description": "Optional timeout in seconds for blocking commands. Defaults to 60. Ignored for non-blocking commands.",
                             "default": 60,
                         },
+                        "poll_interval": {
+                            "type": "number",
+                            "description": "Polling interval in seconds when waiting for blocking commands to finish.",
+                            "default": 0.5,
+                        },
                     },
                     "required": ["command"],
                 },
@@ -106,6 +111,12 @@ class SandboxShellTool(SandboxToolsBase):
                 "path": ".",
                 "required": False,
             },
+            {
+                "param_name": "poll_interval",
+                "node_type": "attribute",
+                "path": ".",
+                "required": False,
+            },
         ],
         example="""
         <!-- NON-BLOCKING COMMANDS (Default) -->
@@ -121,7 +132,7 @@ class SandboxShellTool(SandboxToolsBase):
 
         <!-- BLOCKING COMMANDS (Wait for completion) -->
         <!-- Example 3: Install dependencies and wait for completion -->
-        <execute-command blocking="true" timeout="300">
+        <execute-command blocking="true" timeout="300" poll_interval="0.5">
         npm install
         </execute-command>
 
@@ -138,6 +149,7 @@ class SandboxShellTool(SandboxToolsBase):
         session_name: Optional[str] = None,
         blocking: bool = False,
         timeout: int = 60,
+        poll_interval: float = 0.5,
     ) -> ToolResult:
         try:
             # Ensure sandbox is initialized
@@ -170,60 +182,30 @@ class SandboxShellTool(SandboxToolsBase):
             wrapped_command = full_command.replace('"', '\\"')  # Escape double quotes
 
             # Send command to tmux session
+            sentinel = "__CMD_DONE__"
+            cmd_with_sentinel = f'{wrapped_command}; echo {sentinel}$?'
             await self._execute_raw_command(
-                f'tmux send-keys -t {session_name} "{wrapped_command}" Enter'
+                f'tmux send-keys -t {session_name} "{cmd_with_sentinel}" Enter'
             )
 
             if blocking:
-                # For blocking execution, wait and capture output
+                if poll_interval <= 0:
+                    poll_interval = 0.1
                 start_time = time.time()
-                while (time.time() - start_time) < timeout:
-                    # Wait a bit before checking without blocking the event loop
-                    await asyncio.sleep(1)
-
-                    # Check if session still exists (command might have exited)
-                    check_result = await self._execute_raw_command(
-                        f"tmux has-session -t {session_name} 2>/dev/null || echo 'ended'"
-                    )
-                    if "ended" in check_result.get("output", ""):
-                        break
-
-                    # Get current output and check for common completion indicators
-                    output_result = await self._execute_raw_command(
+                output = ""
+                while time.time() - start_time < timeout:
+                    await asyncio.sleep(poll_interval)
+                    cap = await self._execute_raw_command(
                         f"tmux capture-pane -t {session_name} -p -S - -E -"
                     )
-                    current_output = output_result.get("output", "")
-
-                    # Check for prompt indicators that suggest command completion
-                    last_lines = current_output.split("\n")[-3:]
-                    completion_indicators = [
-                        "$",
-                        "#",
-                        ">",
-                        "Done",
-                        "Completed",
-                        "Finished",
-                        "✓",
-                    ]
-                    if any(
-                        indicator in line
-                        for indicator in completion_indicators
-                        for line in last_lines
-                    ):
+                    output = cap.get("output", "")
+                    if sentinel in output:
                         break
-
-                # Capture final output
-                output_result = await self._execute_raw_command(
-                    f"tmux capture-pane -t {session_name} -p -S - -E -"
-                )
-                final_output = output_result.get("output", "")
-
-                # Kill the session after capture
                 await self._execute_raw_command(f"tmux kill-session -t {session_name}")
-
+                cleaned = output.replace(sentinel, "").rstrip()
                 return self.success_response(
                     {
-                        "output": final_output,
+                        "output": cleaned,
                         "session_name": session_name,
                         "cwd": cwd,
                         "completed": True,
