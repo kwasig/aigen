@@ -147,8 +147,8 @@ class SandboxShellTool(SandboxToolsBase):
                 # For blocking execution, wait and capture output
                 start_time = time.time()
                 while (time.time() - start_time) < timeout:
-                    # Wait a bit before checking without blocking the event loop
-                    await asyncio.sleep(2)
+                    # Wait briefly before polling again
+                    await asyncio.sleep(0.5)
                     
                     # Check if session still exists (command might have exited)
                     check_result = await self._execute_raw_command(f"tmux has-session -t {session_name} 2>/dev/null || echo 'ended'")

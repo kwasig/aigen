@@ -31,6 +31,14 @@ class SandboxFilesTool(SandboxToolsBase):
         except Exception:
             return False
 
+    async def _upload_with_permissions(self, path: str, content: bytes, permissions: str):
+        """Upload content and set permissions with a single thread hop."""
+        def _inner():
+            self.sandbox.fs.upload_file(path, content)
+            self.sandbox.fs.set_file_permissions(path, permissions)
+
+        await asyncio.to_thread(_inner)
+
     async def get_workspace_state(self) -> dict:
         """Get the current workspace state by reading all files"""
         files_state = {}
@@ -126,9 +134,10 @@ class SandboxFilesTool(SandboxToolsBase):
             if parent_dir:
                 await asyncio.to_thread(self.sandbox.fs.create_folder, parent_dir, "755")
             
-            # Write the file content
-            await asyncio.to_thread(self.sandbox.fs.upload_file, full_path, file_contents.encode())
-            await asyncio.to_thread(self.sandbox.fs.set_file_permissions, full_path, permissions)
+            # Write the file content and permissions together
+            await self._upload_with_permissions(
+                full_path, file_contents.encode(), permissions
+            )
             
             # Get preview URL if it's an HTML file
             # preview_url = self._get_preview_url(file_path)
@@ -273,8 +282,9 @@ class SandboxFilesTool(SandboxToolsBase):
             if not await self._file_exists(full_path):
                 return self.fail_response(f"File '{file_path}' does not exist. Use create_file to create a new file.")
             
-            await asyncio.to_thread(self.sandbox.fs.upload_file, full_path, file_contents.encode())
-            await asyncio.to_thread(self.sandbox.fs.set_file_permissions, full_path, permissions)
+            await self._upload_with_permissions(
+                full_path, file_contents.encode(), permissions
+            )
             
             # Get preview URL if it's an HTML file
             # preview_url = self._get_preview_url(file_path)
