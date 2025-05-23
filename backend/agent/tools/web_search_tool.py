@@ -94,7 +94,12 @@ class SandboxWebSearchTool(SandboxToolsBase):
         tag_name="web-search",
         mappings=[
             {"param_name": "query", "node_type": "attribute", "path": "."},
-            {"param_name": "num_results", "node_type": "attribute", "path": "."}
+            {
+                "param_name": "num_results",
+                "node_type": "attribute",
+                "path": ".",
+                "required": False,
+            },
         ],
         example='''
         <!-- 
@@ -155,10 +160,12 @@ class SandboxWebSearchTool(SandboxToolsBase):
             if cached is not None:
                 logging.info("Returning cached web search result")
                 search_response = cached
+                elapsed = 0.0
             else:
                 logging.info(
                     f"Executing web search for query: '{query}' with {num_results} results"
                 )
+                start_time = time.time()
                 search_response = await self.tavily_client.search(
                     query=query,
                     max_results=num_results,
@@ -166,7 +173,12 @@ class SandboxWebSearchTool(SandboxToolsBase):
                     include_answer="advanced",
                     search_depth="advanced",
                 )
+                elapsed = time.time() - start_time
                 await _search_cache.set(cache_key, search_response)
+
+            logging.info(
+                f"Web search completed in {elapsed:.2f}s for query: '{query}'"
+            )
             
             # Return the complete Tavily response 
             # This includes the query, answer, results, images and more

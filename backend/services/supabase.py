@@ -4,6 +4,8 @@ Centralized database connection management for AgentPress using Supabase.
 
 from typing import Optional
 from supabase import create_async_client, AsyncClient
+import inspect
+from utils.http_client import get_http_client, close_http_client
 from utils.logger import logger
 from utils.config import config
 import base64
@@ -41,7 +43,12 @@ class DBConnection:
                 raise RuntimeError("SUPABASE_URL and a key (SERVICE_ROLE_KEY or ANON_KEY) environment variables must be set.")
 
             logger.debug("Initializing Supabase connection")
-            self._client = await create_async_client(supabase_url, supabase_key)
+            client_kwargs = {}
+            if 'http_client' in inspect.signature(create_async_client).parameters:
+                client_kwargs['http_client'] = get_http_client()
+            self._client = await create_async_client(
+                supabase_url, supabase_key, **client_kwargs
+            )
             self._initialized = True
             key_type = "SERVICE_ROLE_KEY" if config.SUPABASE_SERVICE_ROLE_KEY else "ANON_KEY"
             logger.debug(f"Database connection initialized with Supabase using {key_type}")
@@ -55,8 +62,16 @@ class DBConnection:
         if cls._client:
             logger.info("Disconnecting from Supabase database")
             await cls._client.close()
-            cls._initialized = False
-            logger.info("Database disconnected successfully")
+        try:
+            await close_http_client()
+        except Exception as e:
+            logger.warning(f"Error closing shared HTTP client: {e}")
+        cls._initialized = False
+        logger.info("Database disconnected successfully")
+
+    async def close(self):
+        """Alias for disconnect to match expected API."""
+        await self.disconnect()
 
     @property
     async def client(self) -> AsyncClient:
