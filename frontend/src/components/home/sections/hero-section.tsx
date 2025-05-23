@@ -9,14 +9,7 @@ import { useScroll } from 'motion/react';
 import Link from 'next/link';
 import { useRouter } from 'next/navigation';
 import { useAuth } from '@/components/AuthProvider';
-import {
-  createProject,
-  createThread,
-  addUserMessage,
-  startAgent,
-  BillingError,
-} from '@/lib/api';
-import { generateThreadName } from '@/lib/actions/threads';
+import { initiateAgent, BillingError } from '@/lib/api';
 import GoogleSignIn from '@/components/GoogleSignIn';
 import { Input } from '@/components/ui/input';
 import { SubmitButton } from '@/components/ui/submit-button';
@@ -112,30 +105,21 @@ export function HeroSection() {
     setIsSubmitting(true);
 
     try {
-      // Generate a name for the project using GPT
-      const projectName = await generateThreadName(inputValue);
+      const formData = new FormData();
+      formData.append('prompt', inputValue.trim());
+      formData.append('enable_thinking', 'false');
+      formData.append('reasoning_effort', 'low');
+      formData.append('stream', 'true');
+      formData.append('enable_context_manager', 'false');
 
-      // 1. Create a new project with the GPT-generated name
-      const newAgent = await createProject({
-        name: projectName,
-        description: '',
-      });
+      const result = await initiateAgent(formData);
 
-      // 2. Create a new thread for this project
-      const thread = await createThread(newAgent.id);
-
-      // 3. Add the user message to the thread
-      await addUserMessage(thread.thread_id, inputValue.trim());
-
-      // 4. Start the agent with the thread ID
-      await startAgent(thread.thread_id, {
-        stream: true,
-      });
-
-      // 5. Navigate to the new agent's thread page
-      router.push(`/agents/${thread.thread_id}`);
-      // Clear input on success
-      setInputValue('');
+      if (result.thread_id) {
+        router.push(`/agents/${result.thread_id}`);
+        setInputValue('');
+      } else {
+        throw new Error('Agent initiation did not return a thread_id.');
+      }
     } catch (error: any) {
       console.error('Error creating agent:', error);
 
