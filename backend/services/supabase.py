@@ -4,6 +4,7 @@ Centralized database connection management for AgentPress using Supabase.
 
 from typing import Optional
 from supabase import create_async_client, AsyncClient
+from services.http_client import get_http_client
 from utils.logger import logger
 from utils.config import config
 import base64
@@ -41,7 +42,12 @@ class DBConnection:
                 raise RuntimeError("SUPABASE_URL and a key (SERVICE_ROLE_KEY or ANON_KEY) environment variables must be set.")
 
             logger.debug("Initializing Supabase connection")
-            self._client = await create_async_client(supabase_url, supabase_key)
+            http_client = await get_http_client()
+            self._client = await create_async_client(
+                supabase_url,
+                supabase_key,
+                http_client=http_client,
+            )
             self._initialized = True
             key_type = "SERVICE_ROLE_KEY" if config.SUPABASE_SERVICE_ROLE_KEY else "ANON_KEY"
             logger.debug(f"Database connection initialized with Supabase using {key_type}")

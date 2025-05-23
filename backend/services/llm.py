@@ -300,14 +300,16 @@ async def make_llm_api_call(
         reasoning_effort=reasoning_effort
     )
     last_error = None
-    start_time = time.time()
     for attempt in range(MAX_RETRIES):
         try:
             logger.debug(f"Attempt {attempt + 1}/{MAX_RETRIES}")
             # logger.debug(f"API request parameters: {json.dumps(params, indent=2)}")
 
+            attempt_start = time.time()
             response = await litellm.acompletion(**params)
-            LLM_CALL_LATENCY.labels(model_name).observe(time.time() - start_time)
+            elapsed = time.time() - attempt_start
+            LLM_CALL_LATENCY.labels(model_name).observe(elapsed)
+            logger.info(f"LLM API call to {model_name} took {elapsed:.2f}s")
             logger.debug(f"Successfully received API response from {model_name}")
             logger.debug(f"Response: {response}")
             return response

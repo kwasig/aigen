@@ -11,6 +11,7 @@ This module provides comprehensive conversation management, including:
 """
 
 import json
+import time
 from typing import List, Dict, Any, Optional, Type, Union, AsyncGenerator, Literal
 from services.llm import make_llm_api_call
 from agentpress.tool import Tool
@@ -22,9 +23,12 @@ from agentpress.response_processor import (
 )
 from services.supabase import DBConnection
 from utils.logger import logger
+from utils.cache import TTLCache
 
 # Type alias for tool choice
 ToolChoice = Literal["auto", "required", "none"]
+
+_message_cache = TTLCache(maxsize=100, ttl=30)
 
 class ThreadManager:
     """Manages conversation threads with LLM models and tool execution.
@@ -109,10 +113,18 @@ class ThreadManager:
             List of message objects.
         """
         logger.debug(f"Getting messages for thread {thread_id}")
+        cached = await _message_cache.get(thread_id)
+        if cached is not None:
+            logger.debug("Returning cached LLM messages")
+            return cached
+
         client = await self.db.client
 
         try:
+            start = time.time()
             result = await client.rpc('get_llm_formatted_messages', {'p_thread_id': thread_id}).execute()
+            elapsed = time.time() - start
+            logger.info(f"Fetched LLM messages in {elapsed:.2f}s")
 
             # Parse the returned data which might be stringified JSON
             if not result.data:
@@ -139,6 +151,7 @@ class ThreadManager:
                             if 'arguments' in tool_call['function'] and not isinstance(tool_call['function']['arguments'], str):
                                 tool_call['function']['arguments'] = json.dumps(tool_call['function']['arguments'])
 
+            await _message_cache.set(thread_id, messages)
             return messages
 
         except Exception as e:

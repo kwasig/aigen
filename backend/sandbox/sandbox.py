@@ -1,4 +1,6 @@
 import asyncio
+import time
+from typing import Dict, Tuple
 from daytona_sdk import Daytona, DaytonaConfig, CreateSandboxParams, Sandbox, SessionExecuteRequest
 from daytona_api_client.models.workspace_state import WorkspaceState
 from dotenv import load_dotenv
@@ -33,11 +35,19 @@ else:
 daytona = Daytona(daytona_config)
 logger.debug("Daytona client initialized")
 
+SANDBOX_CACHE_TTL = 300  # seconds
+_sandbox_cache: Dict[str, Tuple[Sandbox, float]] = {}
+
 async def get_or_start_sandbox(sandbox_id: str):
     """Retrieve a sandbox by ID, check its state, and start it if needed."""
-    
+
     logger.info(f"Getting or starting sandbox with ID: {sandbox_id}")
-    
+
+    cached = _sandbox_cache.get(sandbox_id)
+    if cached and time.time() - cached[1] < SANDBOX_CACHE_TTL:
+        logger.debug(f"Returning cached sandbox {sandbox_id}")
+        return cached[0]
+
     try:
         sandbox = await asyncio.to_thread(daytona.get_current_sandbox, sandbox_id)
         
@@ -58,6 +68,7 @@ async def get_or_start_sandbox(sandbox_id: str):
                 raise e
         
         logger.info(f"Sandbox {sandbox_id} is ready")
+        _sandbox_cache[sandbox_id] = (sandbox, time.time())
         return sandbox
         
     except Exception as e:

@@ -11,41 +11,11 @@ import datetime
 import asyncio
 import logging
 import time
-from collections import OrderedDict
+from utils.cache import TTLCache
+from services.http_client import get_http_client
 
 
-class _TTLCache:
-    """A simple TTL-based LRU cache for storing search results."""
-
-    def __init__(self, maxsize: int = 50, ttl: int = 600):
-        self.maxsize = maxsize
-        self.ttl = ttl
-        self._store = OrderedDict()
-        self._lock = asyncio.Lock()
-
-    async def get(self, key: str):
-        async with self._lock:
-            item = self._store.get(key)
-            if item is None:
-                return None
-            value, timestamp = item
-            if time.time() - timestamp > self.ttl:
-                del self._store[key]
-                return None
-            self._store.move_to_end(key)
-            return value
-
-    async def set(self, key: str, value):
-        async with self._lock:
-            if key in self._store:
-                self._store.move_to_end(key)
-            self._store[key] = (value, time.time())
-            if len(self._store) > self.maxsize:
-                self._store.popitem(last=False)
-
-# TODO: add subpages, etc... in filters as sometimes its necessary 
-
-_search_cache = _TTLCache()
+_search_cache = TTLCache(maxsize=50, ttl=600)
 
 
 class SandboxWebSearchTool(SandboxToolsBase):
@@ -94,7 +64,12 @@ class SandboxWebSearchTool(SandboxToolsBase):
         tag_name="web-search",
         mappings=[
             {"param_name": "query", "node_type": "attribute", "path": "."},
-            {"param_name": "num_results", "node_type": "attribute", "path": "."}
+            {
+                "param_name": "num_results",
+                "node_type": "attribute",
+                "path": ".",
+                "required": False,
+            },
         ],
         example='''
         <!-- 
@@ -155,10 +130,12 @@ class SandboxWebSearchTool(SandboxToolsBase):
             if cached is not None:
                 logging.info("Returning cached web search result")
                 search_response = cached
+                elapsed = 0.0
             else:
                 logging.info(
                     f"Executing web search for query: '{query}' with {num_results} results"
                 )
+                start_time = time.time()
                 search_response = await self.tavily_client.search(
                     query=query,
                     max_results=num_results,
@@ -166,7 +143,12 @@ class SandboxWebSearchTool(SandboxToolsBase):
                     include_answer="advanced",
                     search_depth="advanced",
                 )
+                elapsed = time.time() - start_time
                 await _search_cache.set(cache_key, search_response)
+
+            logging.info(
+                f"Web search completed in {elapsed:.2f}s for query: '{query}'"
+            )
             
             # Return the complete Tavily response 
             # This includes the query, answer, results, images and more
@@ -355,46 +337,52 @@ class SandboxWebSearchTool(SandboxToolsBase):
         try:
             # ---------- Firecrawl scrape endpoint ----------
             logging.info(f"Sending request to Firecrawl for URL: {url}")
-            async with httpx.AsyncClient() as client:
-                headers = {
-                    "Authorization": f"Bearer {self.firecrawl_api_key}",
-                    "Content-Type": "application/json",
-                }
-                payload = {
-                    "url": url,
-                    "formats": ["markdown"]
-                }
-                
-                # Use longer timeout and retry logic for more reliability
-                max_retries = 3
-                timeout_seconds = 120
-                retry_count = 0
-                
-                while retry_count < max_retries:
-                    try:
-                        logging.info(f"Sending request to Firecrawl (attempt {retry_count + 1}/{max_retries})")
-                        response = await client.post(
-                            f"{self.firecrawl_url}/v1/scrape",
-                            json=payload,
-                            headers=headers,
-                            timeout=timeout_seconds,
+            client = await get_http_client()
+            headers = {
+                "Authorization": f"Bearer {self.firecrawl_api_key}",
+                "Content-Type": "application/json",
+            }
+            payload = {
+                "url": url,
+                "formats": ["markdown"]
+            }
+
+            # Use longer timeout and retry logic for more reliability
+            max_retries = 3
+            timeout_seconds = 120
+            retry_count = 0
+
+            while retry_count < max_retries:
+                try:
+                    logging.info(
+                        f"Sending request to Firecrawl (attempt {retry_count + 1}/{max_retries})"
+                    )
+                    response = await client.post(
+                        f"{self.firecrawl_url}/v1/scrape",
+                        json=payload,
+                        headers=headers,
+                        timeout=timeout_seconds,
+                    )
+                    response.raise_for_status()
+                    data = response.json()
+                    logging.info(f"Successfully received response from Firecrawl for {url}")
+                    break
+                except (httpx.ReadTimeout, httpx.ConnectTimeout, httpx.ReadError) as timeout_err:
+                    retry_count += 1
+                    logging.warning(
+                        f"Request timed out (attempt {retry_count}/{max_retries}): {str(timeout_err)}"
+                    )
+                    if retry_count >= max_retries:
+                        raise Exception(
+                            f"Request timed out after {max_retries} attempts with {timeout_seconds}s timeout"
                         )
-                        response.raise_for_status()
-                        data = response.json()
-                        logging.info(f"Successfully received response from Firecrawl for {url}")
-                        break
-                    except (httpx.ReadTimeout, httpx.ConnectTimeout, httpx.ReadError) as timeout_err:
-                        retry_count += 1
-                        logging.warning(f"Request timed out (attempt {retry_count}/{max_retries}): {str(timeout_err)}")
-                        if retry_count >= max_retries:
-                            raise Exception(f"Request timed out after {max_retries} attempts with {timeout_seconds}s timeout")
-                        # Exponential backoff
-                        logging.info(f"Waiting {2 ** retry_count}s before retry")
-                        await asyncio.sleep(2 ** retry_count)
-                    except Exception as e:
-                        # Don't retry on non-timeout errors
-                        logging.error(f"Error during scraping: {str(e)}")
-                        raise e
+                    # Exponential backoff
+                    logging.info(f"Waiting {2 ** retry_count}s before retry")
+                    await asyncio.sleep(2 ** retry_count)
+                except Exception as e:
+                    # Don't retry on non-timeout errors
+                    logging.error(f"Error during scraping: {str(e)}")
+                    raise e
 
             # Format the response
             title = data.get("data", {}).get("metadata", {}).get("title", "")
