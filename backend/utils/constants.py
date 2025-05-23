@@ -3,6 +3,9 @@ MODEL_ACCESS_TIERS = {
         "openrouter/deepseek/deepseek-chat",
         "openrouter/qwen/qwen3-235b-a22b",
         "openrouter/google/gemini-2.5-flash-preview-05-20",
+        "sambanova/Llama-4-Maverick-17B-128E-Instruct",
+        "sambanova/DeepSeek-V3-0324",
+
     ],
     "tier_2_20": [
         "openrouter/deepseek/deepseek-chat",
@@ -17,6 +20,8 @@ MODEL_ACCESS_TIERS = {
         # "openai/gpt-4.1-2025-04-14",
         # "openrouter/deepseek/deepseek-r1",
         "openrouter/qwen/qwen3-235b-a22b",
+        "sambanova/Llama-4-Maverick-17B-128E-Instruct",
+        "sambanova/DeepSeek-V3-0324",
     ],
     "tier_6_50": [
         "openrouter/deepseek/deepseek-chat",
@@ -31,6 +36,8 @@ MODEL_ACCESS_TIERS = {
         # "openai/gpt-4.1-2025-04-14",
         # "openrouter/deepseek/deepseek-r1",
         "openrouter/qwen/qwen3-235b-a22b",
+        "sambanova/Llama-4-Maverick-17B-128E-Instruct",
+        "sambanova/DeepSeek-V3-0324",
     ],
     "tier_12_100": [
         "openrouter/deepseek/deepseek-chat",
@@ -45,6 +52,8 @@ MODEL_ACCESS_TIERS = {
         # "openai/gpt-4.1-2025-04-14",
         # "openrouter/deepseek/deepseek-r1",
         "openrouter/qwen/qwen3-235b-a22b",
+        "sambanova/Llama-4-Maverick-17B-128E-Instruct",
+        "sambanova/DeepSeek-V3-0324",
     ],
     "tier_25_200": [
         "openrouter/deepseek/deepseek-chat",
@@ -73,6 +82,8 @@ MODEL_ACCESS_TIERS = {
         # "openai/gpt-4.1-2025-04-14",
         # "openrouter/deepseek/deepseek-r1",
         "openrouter/qwen/qwen3-235b-a22b",
+        "sambanova/Llama-4-Maverick-17B-128E-Instruct",
+        "sambanova/DeepSeek-V3-0324",
     ],
     "tier_125_800": [
         "openrouter/deepseek/deepseek-chat",
@@ -101,6 +112,8 @@ MODEL_ACCESS_TIERS = {
         # "openai/gpt-4.1-2025-04-14",
         # "openrouter/deepseek/deepseek-r1",
         "openrouter/qwen/qwen3-235b-a22b",
+        "sambanova/Llama-4-Maverick-17B-128E-Instruct",
+        "sambanova/DeepSeek-V3-0324",
     ],
 }
 MODEL_NAME_ALIASES = {
@@ -117,7 +130,7 @@ MODEL_NAME_ALIASES = {
     # "gpt-4": "openai/gpt-4",  # Commented out in constants.py
     # "gemini-flash-2.5": "openrouter/google/gemini-2.5-flash-preview",  # Commented out in constants.py
     # "grok-3": "xai/grok-3-fast-latest",  # Commented out in constants.py
-    "deepseek": "openrouter/deepseek/deepseek-chat",
+    "deepseek": "sambanova/DeepSeek-V3-0324",
     # "deepseek-r1": "openrouter/deepseek/deepseek-r1",
     # "grok-3-mini": "xai/grok-3-mini-fast-beta",  # Commented out in constants.py
     "qwen3": "openrouter/qwen/qwen3-235b-a22b",  # Commented out in constants.py
@@ -128,6 +141,8 @@ MODEL_NAME_ALIASES = {
     # "google/gemini-2.5-flash-preview:thinking":"openrouter/google/gemini-2.5-flash-preview:thinking",
     "google/gemini-2.5-pro-preview":"openrouter/google/gemini-2.5-pro-preview",
     "deepseek/deepseek-chat-v3-0324":"openrouter/deepseek/deepseek-chat-v3-0324",
+    "maverick":"sambanova/Llama-4-Maverick-17B-128E-Instruct",
+    "deepseekv3-0324":"sambanova/DeepSeek-V3-0324",
 
     # Also include full names as keys to ensure they map to themselves
     # "anthropic/claude-3-7-sonnet-latest": "anthropic/claude-3-7-sonnet-latest",
