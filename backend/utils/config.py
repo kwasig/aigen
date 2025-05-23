@@ -164,6 +164,11 @@ class Configuration:
     # Toggle to enable or disable the browser tool. Disabling this tool can
     # significantly reduce overhead when browser automation is not required.
     ENABLE_BROWSER_TOOL: bool = False
+    # Default timeout (in seconds) for sandbox process commands.  This value is
+    # used by various tools when executing commands inside the sandbox.
+    # It can be overridden via the SANDBOX_DEFAULT_TIMEOUT environment variable
+    # to tweak performance without modifying code.
+    SANDBOX_DEFAULT_TIMEOUT: int = 60
 
     @property
     def STRIPE_PRODUCT_ID(self) -> str:

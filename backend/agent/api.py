@@ -1078,47 +1078,51 @@ async def initiate_agent_with_files(
         if files:
             successful_uploads = []
             failed_uploads = []
-            for file in files:
-                if file.filename:
-                    try:
-                        safe_filename = file.filename.replace('/', '_').replace('\\', '_')
-                        target_path = f"/workspace/{safe_filename}"
-                        logger.info(f"Attempting to upload {safe_filename} to {target_path} in sandbox {sandbox_id}")
-                        content = await file.read()
-                        upload_successful = False
-                        try:
-                            if hasattr(sandbox, 'fs') and hasattr(sandbox.fs, 'upload_file'):
-                                import inspect
-                                if inspect.iscoroutinefunction(sandbox.fs.upload_file):
-                                    await sandbox.fs.upload_file(target_path, content)
-                                else:
-                                    sandbox.fs.upload_file(target_path, content)
-                                logger.debug(f"Called sandbox.fs.upload_file for {target_path}")
-                                upload_successful = True
-                            else:
-                                raise NotImplementedError("Suitable upload method not found on sandbox object.")
-                        except Exception as upload_error:
-                            logger.error(f"Error during sandbox upload call for {safe_filename}: {str(upload_error)}", exc_info=True)
 
-                        if upload_successful:
-                            successful_uploads.append(target_path)
-                            logger.info(
-                                f"Successfully uploaded file {safe_filename} to sandbox path {target_path}"
-                            )
+            async def handle_file(file):
+                if not file.filename:
+                    return None, None
+                safe_filename = file.filename.replace('/', '_').replace('\\', '_')
+                target_path = f"/workspace/{safe_filename}"
+                logger.info(
+                    f"Attempting to upload {safe_filename} to {target_path} in sandbox {sandbox_id}"
+                )
+                try:
+                    content = await file.read()
+                    if hasattr(sandbox, 'fs') and hasattr(sandbox.fs, 'upload_file'):
+                        import inspect
+                        if inspect.iscoroutinefunction(sandbox.fs.upload_file):
+                            await sandbox.fs.upload_file(target_path, content)
                         else:
-                            failed_uploads.append(safe_filename)
-                    except Exception as file_error:
-                        logger.error(f"Error processing file {file.filename}: {str(file_error)}", exc_info=True)
-                        failed_uploads.append(file.filename)
-                    finally:
-                        await file.close()
+                            sandbox.fs.upload_file(target_path, content)
+                        logger.debug(f"Called sandbox.fs.upload_file for {target_path}")
+                        return target_path, None
+                    else:
+                        raise NotImplementedError("Suitable upload method not found on sandbox object.")
+                except Exception as upload_error:
+                    logger.error(
+                        f"Error during sandbox upload call for {safe_filename}: {str(upload_error)}",
+                        exc_info=True,
+                    )
+                    return None, safe_filename
+                finally:
+                    await file.close()
+
+            results = await asyncio.gather(*(handle_file(f) for f in files))
+            for success, fail in results:
+                if success:
+                    successful_uploads.append(success)
+                if fail:
+                    failed_uploads.append(fail)
 
             if successful_uploads:
                 message_content += "\n\n" if message_content else ""
-                for file_path in successful_uploads: message_content += f"[Uploaded File: {file_path}]\n"
+                for file_path in successful_uploads:
+                    message_content += f"[Uploaded File: {file_path}]\n"
             if failed_uploads:
                 message_content += "\n\nThe following files failed to upload:\n"
-                for failed_file in failed_uploads: message_content += f"- {failed_file}\n"
+                for failed_file in failed_uploads:
+                    message_content += f"- {failed_file}\n"
 
         # 5. Add initial user message to thread
         message_id = str(uuid.uuid4())
