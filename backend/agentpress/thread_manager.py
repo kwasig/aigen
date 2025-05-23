@@ -12,7 +12,10 @@ This module provides comprehensive conversation management, including:
 
 import json
 from typing import List, Dict, Any, Optional, Type, Union, AsyncGenerator, Literal
-from services.llm import make_llm_api_call
+from services.llm import make_llm_api_call, LLMRetryError
+
+# Maximum tokens allowed by the primary model (approximate)
+MODEL_CONTEXT_LIMIT = 32768
 from agentpress.tool import Tool
 from agentpress.tool_registry import ToolRegistry
 from agentpress.context_manager import ContextManager
@@ -264,9 +267,28 @@ Here are the XML tools available with examples:
                 try:
                     from litellm import token_counter
                     # Use the potentially modified working_system_prompt for token counting
-                    token_count = token_counter(model=llm_model, messages=[working_system_prompt] + messages)
+                token_count = token_counter(model=llm_model, messages=[working_system_prompt] + messages)
                     token_threshold = self.context_manager.token_threshold
-                    logger.info(f"Thread {thread_id} token count: {token_count}/{token_threshold} ({(token_count/token_threshold)*100:.1f}%)")
+                    logger.info(
+                        f"Thread {thread_id} token count: {token_count}/{token_threshold} ({(token_count/token_threshold)*100:.1f}%)"
+                    )
+
+                    if enable_context_manager and token_count >= MODEL_CONTEXT_LIMIT - 500:
+                        logger.warning(
+                            f"Token count {token_count} approaching context limit; summarizing before LLM call"
+                        )
+                        summarized = await self.context_manager.check_and_summarize_if_needed(
+                            thread_id,
+                            self.add_message,
+                            model=llm_model,
+                            force=True,
+                        )
+                        if summarized:
+                            logger.info("Summarization successful, reloading messages")
+                            messages = await self.get_llm_messages(thread_id)
+                            token_count = token_counter(
+                                model=llm_model, messages=[working_system_prompt] + messages
+                            )
 
                     # if token_count >= token_threshold and enable_context_manager:
                     #     logger.info(f"Thread token count ({token_count}) exceeds threshold ({token_threshold}), summarizing...")
@@ -334,6 +356,36 @@ Here are the XML tools available with examples:
                         reasoning_effort=reasoning_effort
                     )
                     logger.debug("Successfully received raw LLM API response stream/object")
+
+                except LLMRetryError as e:
+                    if "maximum context length" in str(e).lower():
+                        logger.warning("LLM context length exceeded, summarizing and retrying once")
+                        summarized = await self.context_manager.check_and_summarize_if_needed(
+                            thread_id,
+                            self.add_message,
+                            model=llm_model,
+                            force=True,
+                        )
+                        if summarized:
+                            messages = await self.get_llm_messages(thread_id)
+                            prepared_messages = [working_system_prompt] + messages
+                            llm_response = await make_llm_api_call(
+                                prepared_messages,
+                                llm_model,
+                                temperature=llm_temperature,
+                                max_tokens=llm_max_tokens,
+                                tools=openapi_tool_schemas,
+                                tool_choice=tool_choice if processor_config.native_tool_calling else None,
+                                stream=stream,
+                                enable_thinking=enable_thinking,
+                                reasoning_effort=reasoning_effort,
+                            )
+                            logger.debug("Successfully received raw LLM API response stream/object after summarization")
+                        else:
+                            raise
+                    else:
+                        logger.error(f"Failed to make LLM API call: {str(e)}", exc_info=True)
+                        raise
 
                 except Exception as e:
                     logger.error(f"Failed to make LLM API call: {str(e)}", exc_info=True)

@@ -39,6 +39,7 @@ class ToolExecutionContext:
     error: Optional[Exception] = None
     assistant_message_id: Optional[str] = None
     parsing_details: Optional[Dict[str, Any]] = None
+    thread_id: Optional[str] = None
 
 @dataclass
 class ProcessorConfig:
@@ -91,6 +92,7 @@ class ResponseProcessor:
         """
         self.tool_registry = tool_registry
         self.add_message = add_message_callback
+        self._executed_tool_cache: Dict[Tuple[str, str], ToolResult] = {}
         
     async def process_streaming_response(
         self,
@@ -200,7 +202,11 @@ class ResponseProcessor:
                                     xml_tool_call_count += 1
                                     current_assistant_id = last_assistant_message_object['message_id'] if last_assistant_message_object else None
                                     context = self._create_tool_context(
-                                        tool_call, tool_index, current_assistant_id, parsing_details
+                                        tool_call,
+                                        tool_index,
+                                        current_assistant_id,
+                                        parsing_details,
+                                        thread_id,
                                     )
 
                                     if config.execute_tools and config.execute_on_stream:
@@ -209,7 +215,9 @@ class ResponseProcessor:
                                         if started_msg_obj: yield started_msg_obj
                                         yielded_tool_indices.add(tool_index) # Mark status as yielded
 
-                                        execution_task = asyncio.create_task(self._execute_tool(tool_call))
+                                        execution_task = asyncio.create_task(
+                                            self._execute_tool(tool_call, thread_id)
+                                        )
                                         pending_tool_executions.append({
                                             "task": execution_task, "tool_call": tool_call,
                                             "tool_index": tool_index, "context": context
@@ -271,7 +279,11 @@ class ResponseProcessor:
                                 }
                                 current_assistant_id = last_assistant_message_object['message_id'] if last_assistant_message_object else None
                                 context = self._create_tool_context(
-                                    tool_call_data, tool_index, current_assistant_id
+                                    tool_call_data,
+                                    tool_index,
+                                    current_assistant_id,
+                                    None,
+                                    thread_id,
                                 )
 
                                 # Save and Yield tool_started status
@@ -279,7 +291,9 @@ class ResponseProcessor:
                                 if started_msg_obj: yield started_msg_obj
                                 yielded_tool_indices.add(tool_index) # Mark status as yielded
 
-                                execution_task = asyncio.create_task(self._execute_tool(tool_call_data))
+                                execution_task = asyncio.create_task(
+                                    self._execute_tool(tool_call_data, thread_id)
+                                )
                                 pending_tool_executions.append({
                                     "task": execution_task, "tool_call": tool_call_data,
                                     "tool_index": tool_index, "context": context
@@ -467,16 +481,22 @@ class ResponseProcessor:
                 # Or execute now if not streamed
                 elif final_tool_calls_to_process and not config.execute_on_stream:
                     logger.info(f"Executing {len(final_tool_calls_to_process)} tools ({config.tool_execution_strategy}) after stream")
-                    results_list = await self._execute_tools(final_tool_calls_to_process, config.tool_execution_strategy)
+                    results_list = await self._execute_tools(
+                        final_tool_calls_to_process,
+                        config.tool_execution_strategy,
+                        thread_id,
+                    )
                     current_tool_idx = 0
                     for tc, res in results_list:
                        # Map back using all_tool_data_map which has correct indices
                        if current_tool_idx in all_tool_data_map:
                            tool_data = all_tool_data_map[current_tool_idx]
                            context = self._create_tool_context(
-                               tc, current_tool_idx,
+                               tc,
+                               current_tool_idx,
                                last_assistant_message_object['message_id'] if last_assistant_message_object else None,
-                               tool_data.get('parsing_details')
+                               tool_data.get('parsing_details'),
+                               thread_id,
                            )
                            context.result = res
                            tool_results_map[current_tool_idx] = (tc, res, context)
@@ -716,7 +736,11 @@ class ResponseProcessor:
             tool_calls_to_execute = [item['tool_call'] for item in all_tool_data]
             if config.execute_tools and tool_calls_to_execute:
                 logger.info(f"Executing {len(tool_calls_to_execute)} tools with strategy: {config.tool_execution_strategy}")
-                tool_results = await self._execute_tools(tool_calls_to_execute, config.tool_execution_strategy)
+                tool_results = await self._execute_tools(
+                    tool_calls_to_execute,
+                    config.tool_execution_strategy,
+                    thread_id,
+                )
 
                 for i, (returned_tool_call, result) in enumerate(tool_results):
                     original_data = all_tool_data[i]
@@ -725,7 +749,11 @@ class ResponseProcessor:
                     current_assistant_id = assistant_message_object['message_id'] if assistant_message_object else None
 
                     context = self._create_tool_context(
-                        tool_call_from_data, tool_index, current_assistant_id, parsing_details
+                        tool_call_from_data,
+                        tool_index,
+                        current_assistant_id,
+                        parsing_details,
+                        thread_id,
                     )
                     context.result = result
 
@@ -1057,8 +1085,12 @@ class ResponseProcessor:
         return parsed_data
 
     # Tool execution methods
-    async def _execute_tool(self, tool_call: Dict[str, Any]) -> ToolResult:
-        """Execute a single tool call and return the result."""
+    async def _execute_tool(self, tool_call: Dict[str, Any], thread_id: Optional[str] = None) -> ToolResult:
+        """Execute a single tool call and return the result.
+
+        If the same tool call has already been executed for the thread,
+        return the cached result to avoid loops.
+        """
         try:
             function_name = tool_call["function_name"]
             arguments = tool_call["arguments"]
@@ -1075,6 +1107,13 @@ class ResponseProcessor:
                     arguments = json.loads(arguments)
                 except json.JSONDecodeError:
                     arguments = {"text": arguments}
+
+            signature = f"{function_name}:{json.dumps(arguments, sort_keys=True)}"
+            if thread_id and (thread_id, signature) in self._executed_tool_cache:
+                logger.info(
+                    f"Skipping duplicate tool call {function_name} for thread {thread_id}"
+                )
+                return self._executed_tool_cache[(thread_id, signature)]
             
             # Use cached available functions to avoid registry lookup overhead
             if not hasattr(self, '_cached_functions'):
@@ -1096,6 +1135,8 @@ class ResponseProcessor:
                 
             if not is_common_tool:
                 logger.info(f"Tool execution complete: {function_name}")
+            if thread_id:
+                self._executed_tool_cache[(thread_id, signature)] = result
             return result
         except asyncio.TimeoutError:
             logger.error(f"Timeout executing tool {tool_call.get('function_name', 'unknown')}")
@@ -1105,9 +1146,10 @@ class ResponseProcessor:
             return ToolResult(success=False, output=f"Error executing tool: {str(e)}")
 
     async def _execute_tools(
-        self, 
-        tool_calls: List[Dict[str, Any]], 
-        execution_strategy: ToolExecutionStrategy = "sequential"
+        self,
+        tool_calls: List[Dict[str, Any]],
+        execution_strategy: ToolExecutionStrategy = "sequential",
+        thread_id: Optional[str] = None,
     ) -> List[Tuple[Dict[str, Any], ToolResult]]:
         """Execute tool calls with the specified strategy.
         
@@ -1126,14 +1168,18 @@ class ResponseProcessor:
         logger.info(f"Executing {len(tool_calls)} tools with strategy: {execution_strategy}")
             
         if execution_strategy == "sequential":
-            return await self._execute_tools_sequentially(tool_calls)
+            return await self._execute_tools_sequentially(tool_calls, thread_id)
         elif execution_strategy == "parallel":
-            return await self._execute_tools_in_parallel(tool_calls)
+            return await self._execute_tools_in_parallel(tool_calls, thread_id)
         else:
-            logger.warning(f"Unknown execution strategy: {execution_strategy}, falling back to sequential")
-            return await self._execute_tools_sequentially(tool_calls)
+            logger.warning(
+                f"Unknown execution strategy: {execution_strategy}, falling back to sequential"
+            )
+            return await self._execute_tools_sequentially(tool_calls, thread_id)
 
-    async def _execute_tools_sequentially(self, tool_calls: List[Dict[str, Any]]) -> List[Tuple[Dict[str, Any], ToolResult]]:
+    async def _execute_tools_sequentially(
+        self, tool_calls: List[Dict[str, Any]], thread_id: Optional[str] = None
+    ) -> List[Tuple[Dict[str, Any], ToolResult]]:
         """Execute tool calls sequentially and return results.
         
         This method executes tool calls one after another, waiting for each tool to complete
@@ -1158,7 +1204,7 @@ class ResponseProcessor:
                 logger.debug(f"Executing tool {index+1}/{len(tool_calls)}: {tool_name}")
                 
                 try:
-                    result = await self._execute_tool(tool_call)
+                    result = await self._execute_tool(tool_call, thread_id)
                     results.append((tool_call, result))
                     logger.debug(f"Completed tool {tool_name} with success={result.success}")
                 except Exception as e:
@@ -1181,7 +1227,9 @@ class ResponseProcessor:
                             
             return (results if 'results' in locals() else []) + error_results
 
-    async def _execute_tools_in_parallel(self, tool_calls: List[Dict[str, Any]]) -> List[Tuple[Dict[str, Any], ToolResult]]:
+    async def _execute_tools_in_parallel(
+        self, tool_calls: List[Dict[str, Any]], thread_id: Optional[str] = None
+    ) -> List[Tuple[Dict[str, Any], ToolResult]]:
         """Execute tool calls in parallel and return results.
         
         This method executes all tool calls simultaneously using asyncio.gather, which
@@ -1201,7 +1249,7 @@ class ResponseProcessor:
             logger.info(f"Executing {len(tool_calls)} tools in parallel: {tool_names}")
             
             # Create tasks for all tool calls
-            tasks = [self._execute_tool(tool_call) for tool_call in tool_calls]
+            tasks = [self._execute_tool(tool_call, thread_id) for tool_call in tool_calls]
             
             # Execute all tasks concurrently with error handling
             results = await asyncio.gather(*tasks, return_exceptions=True)
@@ -1314,7 +1362,13 @@ class ResponseProcessor:
             result_role = "user" if strategy == "user_message" else "assistant"
             
             # Create a context for consistent formatting
-            context = self._create_tool_context(tool_call, 0, assistant_message_id, parsing_details)
+            context = self._create_tool_context(
+                tool_call,
+                0,
+                assistant_message_id,
+                parsing_details,
+                thread_id,
+            )
             context.result = result
             
             # Format the content using the formatting helper
@@ -1373,13 +1427,21 @@ class ResponseProcessor:
         function_name = tool_call["function_name"]
         return f"Result for {function_name}: {str(result)}"
 
-    def _create_tool_context(self, tool_call: Dict[str, Any], tool_index: int, assistant_message_id: Optional[str] = None, parsing_details: Optional[Dict[str, Any]] = None) -> ToolExecutionContext:
+    def _create_tool_context(
+        self,
+        tool_call: Dict[str, Any],
+        tool_index: int,
+        assistant_message_id: Optional[str] = None,
+        parsing_details: Optional[Dict[str, Any]] = None,
+        thread_id: Optional[str] = None,
+    ) -> ToolExecutionContext:
         """Create a tool execution context with display name and parsing details populated."""
         context = ToolExecutionContext(
             tool_call=tool_call,
             tool_index=tool_index,
             assistant_message_id=assistant_message_id,
-            parsing_details=parsing_details
+            parsing_details=parsing_details,
+            thread_id=thread_id,
         )
         
         # Set function_name and xml_tag_name fields
