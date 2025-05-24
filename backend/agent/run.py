@@ -3,6 +3,7 @@ import json
 import re
 from uuid import uuid4
 from typing import Optional
+import asyncio
 
 # from agent.tools.message_tool import MessageTool
 from agent.tools.message_tool import MessageTool
@@ -113,8 +114,15 @@ async def run_agent(
                 "message": error_msg
             }
             break
+        # Fetch latest messages concurrently
+        latest_message_task = client.table('messages').select('*').eq('thread_id', thread_id).in_('type', ['assistant', 'tool', 'user']).order('created_at', desc=True).limit(1).execute()
+        browser_state_task = client.table('messages').select('*').eq('thread_id', thread_id).eq('type', 'browser_state').order('created_at', desc=True).limit(1).execute()
+        image_context_task = client.table('messages').select('*').eq('thread_id', thread_id).eq('type', 'image_context').order('created_at', desc=True).limit(1).execute()
+        latest_message, latest_browser_state_msg, latest_image_context_msg = await asyncio.gather(
+            latest_message_task, browser_state_task, image_context_task
+        )
+
         # Check if last message is from assistant using direct Supabase query
-        latest_message = await client.table('messages').select('*').eq('thread_id', thread_id).in_('type', ['assistant', 'tool', 'user']).order('created_at', desc=True).limit(1).execute()
         if latest_message.data and len(latest_message.data) > 0:
             message_type = latest_message.data[0].get('type')
             if message_type == 'assistant':
@@ -124,10 +132,8 @@ async def run_agent(
 
         # ---- Temporary Message Handling (Browser State & Image Context) ----
         temporary_message = None
-        temp_message_content_list = [] # List to hold text/image blocks
+        temp_message_content_list = []  # List to hold text/image blocks
 
-        # Get the latest browser_state message
-        latest_browser_state_msg = await client.table('messages').select('*').eq('thread_id', thread_id).eq('type', 'browser_state').order('created_at', desc=True).limit(1).execute()
         if latest_browser_state_msg.data and len(latest_browser_state_msg.data) > 0:
             try:
                 browser_content = json.loads(latest_browser_state_msg.data[0]["content"])
@@ -167,8 +173,7 @@ async def run_agent(
             except Exception as e:
                 logger.error(f"Error parsing browser state: {e}")
 
-        # Get the latest image_context message (NEW)
-        latest_image_context_msg = await client.table('messages').select('*').eq('thread_id', thread_id).eq('type', 'image_context').order('created_at', desc=True).limit(1).execute()
+        # Process latest image_context message if available
         if latest_image_context_msg.data and len(latest_image_context_msg.data) > 0:
             try:
                 image_context_content = json.loads(latest_image_context_msg.data[0]["content"])
@@ -208,6 +213,7 @@ async def run_agent(
             max_tokens = 4096
             
         generation = trace.generation(name="thread_manager.run_thread")
+        include_examples = iteration_count == 1
         try:
             # Make the LLM call and process the response
             response = await thread_manager.run_thread(
@@ -218,7 +224,7 @@ async def run_agent(
                 llm_temperature=0,
                 llm_max_tokens=max_tokens,
                 tool_choice="auto",
-                max_xml_tool_calls=1,
+                max_xml_tool_calls=3,
                 temporary_message=temporary_message,
                 processor_config=ProcessorConfig(
                     xml_tool_calling=True,
@@ -229,7 +235,7 @@ async def run_agent(
                     xml_adding_strategy="user_message"
                 ),
                 native_max_auto_continues=native_max_auto_continues,
-                include_xml_examples=True,
+                include_xml_examples=include_examples,
                 enable_thinking=enable_thinking,
                 reasoning_effort=reasoning_effort,
                 enable_context_manager=enable_context_manager,

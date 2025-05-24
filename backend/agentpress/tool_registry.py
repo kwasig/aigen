@@ -25,6 +25,8 @@ class ToolRegistry:
         """Initialize a new ToolRegistry instance."""
         self.tools = {}
         self.xml_tools = {}
+        self._openapi_schemas_cache = None
+        self._xml_examples_cache = None
         logger.debug("Initialized new ToolRegistry instance")
     
     def register_tool(self, tool_class: Type[Tool], function_names: Optional[List[str]] = None, **kwargs):
@@ -67,8 +69,11 @@ class ToolRegistry:
                         }
                         registered_xml += 1
                         logger.debug(f"Registered XML tag {schema.xml_schema.tag_name} -> {func_name} from {tool_class.__name__}")
-        
+
         logger.debug(f"Tool registration complete for {tool_class.__name__}: {registered_openapi} OpenAPI functions, {registered_xml} XML tags")
+        # Invalidate caches when new tools are registered
+        self._openapi_schemas_cache = None
+        self._xml_examples_cache = None
 
     def get_available_functions(self) -> Dict[str, Callable]:
         """Get all available tool functions.
@@ -125,28 +130,31 @@ class ToolRegistry:
 
     def get_openapi_schemas(self) -> List[Dict[str, Any]]:
         """Get OpenAPI schemas for function calling.
-        
+
         Returns:
             List of OpenAPI-compatible schema definitions
         """
-        schemas = [
-            tool_info['schema'].schema 
-            for tool_info in self.tools.values()
-            if tool_info['schema'].schema_type == SchemaType.OPENAPI
-        ]
-        logger.debug(f"Retrieved {len(schemas)} OpenAPI schemas")
-        return schemas
+        if self._openapi_schemas_cache is None:
+            self._openapi_schemas_cache = [
+                tool_info['schema'].schema
+                for tool_info in self.tools.values()
+                if tool_info['schema'].schema_type == SchemaType.OPENAPI
+            ]
+            logger.debug(f"Retrieved {len(self._openapi_schemas_cache)} OpenAPI schemas")
+        return self._openapi_schemas_cache
 
     def get_xml_examples(self) -> Dict[str, str]:
         """Get all XML tag examples.
-        
+
         Returns:
             Dict mapping tag names to their example usage
         """
-        examples = {}
-        for tool_info in self.xml_tools.values():
-            schema = tool_info['schema']
-            if schema.xml_schema and schema.xml_schema.example:
-                examples[schema.xml_schema.tag_name] = schema.xml_schema.example
-        logger.debug(f"Retrieved {len(examples)} XML examples")
-        return examples
+        if self._xml_examples_cache is None:
+            examples = {}
+            for tool_info in self.xml_tools.values():
+                schema = tool_info['schema']
+                if schema.xml_schema and schema.xml_schema.example:
+                    examples[schema.xml_schema.tag_name] = schema.xml_schema.example
+            self._xml_examples_cache = examples
+            logger.debug(f"Retrieved {len(examples)} XML examples")
+        return self._xml_examples_cache
