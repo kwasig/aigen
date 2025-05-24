@@ -164,6 +164,12 @@ DAYTONA_API_KEY=your-daytona-key
 DAYTONA_SERVER_URL=https://app.daytona.io/api
 DAYTONA_TARGET=us
 
+# Performance tuning
+# Allow multiple tool calls per LLM iteration
+XML_TOOL_LIMIT=3
+# Enable token counting for debugging (disabled by default)
+ENABLE_TOKEN_COUNT=false
+
 NEXT_PUBLIC_URL=http://localhost:3000
 ```
 
