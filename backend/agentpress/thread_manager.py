@@ -13,6 +13,10 @@ This module provides comprehensive conversation management, including:
 import json
 from typing import List, Dict, Any, Optional, Type, Union, AsyncGenerator, Literal
 from services.llm import make_llm_api_call
+import os
+
+# Optional token counting for debugging large conversations
+TOKEN_COUNT_ENABLED = os.getenv("ENABLE_TOKEN_COUNT", "false").lower() == "true"
 from agentpress.tool import Tool
 from agentpress.tool_registry import ToolRegistry
 from agentpress.context_manager import ContextManager
@@ -263,36 +267,18 @@ Here are the XML tools available with examples:
                 # 1. Get messages from thread for LLM call
                 messages = await self.get_llm_messages(thread_id)
 
-                # 2. Check token count before proceeding
-                token_count = 0
-                try:
-                    from litellm import token_counter
-                    # Use the potentially modified working_system_prompt for token counting
-                    token_count = token_counter(model=llm_model, messages=[working_system_prompt] + messages)
-                    token_threshold = self.context_manager.token_threshold
-                    logger.info(f"Thread {thread_id} token count: {token_count}/{token_threshold} ({(token_count/token_threshold)*100:.1f}%)")
-
-                    # if token_count >= token_threshold and enable_context_manager:
-                    #     logger.info(f"Thread token count ({token_count}) exceeds threshold ({token_threshold}), summarizing...")
-                    #     summarized = await self.context_manager.check_and_summarize_if_needed(
-                    #         thread_id=thread_id,
-                    #         add_message_callback=self.add_message,
-                    #         model=llm_model,
-                    #         force=True
-                    #     )
-                    #     if summarized:
-                    #         logger.info("Summarization complete, fetching updated messages with summary")
-                    #         messages = await self.get_llm_messages(thread_id)
-                    #         # Recount tokens after summarization, using the modified prompt
-                    #         new_token_count = token_counter(model=llm_model, messages=[working_system_prompt] + messages)
-                    #         logger.info(f"After summarization: token count reduced from {token_count} to {new_token_count}")
-                    #     else:
-                    #         logger.warning("Summarization failed or wasn't needed - proceeding with original messages")
-                    # elif not enable_context_manager:
-                    #     logger.info("Automatic summarization disabled. Skipping token count check and summarization.")
-
-                except Exception as e:
-                    logger.error(f"Error counting tokens or summarizing: {str(e)}")
+                # 2. Optionally check token count before proceeding
+                if TOKEN_COUNT_ENABLED:
+                    token_count = 0
+                    try:
+                        from litellm import token_counter
+                        token_count = token_counter(model=llm_model, messages=[working_system_prompt] + messages)
+                        token_threshold = self.context_manager.token_threshold
+                        logger.info(
+                            f"Thread {thread_id} token count: {token_count}/{token_threshold} ({(token_count/token_threshold)*100:.1f}%)"
+                        )
+                    except Exception as e:
+                        logger.error(f"Error counting tokens: {str(e)}")
 
                 # 3. Prepare messages for LLM call + add temporary message if it exists
                 # Use the working_system_prompt which may contain the XML examples

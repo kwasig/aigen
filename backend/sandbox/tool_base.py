@@ -1,5 +1,6 @@
 
-from typing import Optional
+from typing import Optional, Callable, Any
+import asyncio
 
 from agentpress.thread_manager import ThreadManager
 from agentpress.tool import Tool
@@ -81,6 +82,11 @@ class SandboxToolsBase(Tool):
         if self._sandbox_id is None:
             raise RuntimeError("Sandbox ID not initialized. Call _ensure_sandbox() first.")
         return self._sandbox_id
+
+    async def _call_async(self, func: Callable[..., Any], *args, **kwargs) -> Any:
+        """Run blocking sandbox operations in a thread to avoid blocking the event loop."""
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(None, lambda: func(*args, **kwargs))
 
     def clean_path(self, path: str) -> str:
         """Clean and normalize a path to be relative to /workspace."""
