@@ -30,6 +30,9 @@ from agent.gemini_prompt import get_gemini_system_prompt
 
 load_dotenv()
 
+# Limit how many XML tool calls are processed per iteration
+MAX_XML_TOOL_CALLS = int(os.getenv("XML_TOOL_LIMIT", "3"))
+
 async def run_agent(
     thread_id: str,
     project_id: str,
@@ -223,7 +226,7 @@ async def run_agent(
                 llm_temperature=0,
                 llm_max_tokens=max_tokens,
                 tool_choice="auto",
-                max_xml_tool_calls=1,
+                max_xml_tool_calls=MAX_XML_TOOL_CALLS,
                 temporary_message=temporary_message,
                 processor_config=ProcessorConfig(
                     xml_tool_calling=True,
