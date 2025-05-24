@@ -210,6 +210,7 @@ async def run_agent(
         generation = trace.generation(name="thread_manager.run_thread")
         try:
             # Make the LLM call and process the response
+            include_examples = iteration_count == 1
             response = await thread_manager.run_thread(
                 thread_id=thread_id,
                 system_prompt=system_message,
@@ -218,7 +219,7 @@ async def run_agent(
                 llm_temperature=0,
                 llm_max_tokens=max_tokens,
                 tool_choice="auto",
-                max_xml_tool_calls=1,
+                max_xml_tool_calls=3,
                 temporary_message=temporary_message,
                 processor_config=ProcessorConfig(
                     xml_tool_calling=True,
@@ -229,7 +230,8 @@ async def run_agent(
                     xml_adding_strategy="user_message"
                 ),
                 native_max_auto_continues=native_max_auto_continues,
-                include_xml_examples=True,
+                include_xml_examples=include_examples,
+                count_tokens=include_examples,
                 enable_thinking=enable_thinking,
                 reasoning_effort=reasoning_effort,
                 enable_context_manager=enable_context_manager,

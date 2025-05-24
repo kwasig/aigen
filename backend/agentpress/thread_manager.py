@@ -161,6 +161,7 @@ class ThreadManager:
         native_max_auto_continues: int = 25,
         max_xml_tool_calls: int = 0,
         include_xml_examples: bool = False,
+        count_tokens: bool = True,
         enable_thinking: Optional[bool] = False,
         reasoning_effort: Optional[str] = 'low',
         enable_context_manager: bool = True,
@@ -183,6 +184,7 @@ class ThreadManager:
                                       finish_reason="tool_calls" (0 disables auto-continue)
             max_xml_tool_calls: Maximum number of XML tool calls to allow (0 = no limit)
             include_xml_examples: Whether to include XML tool examples in the system prompt
+            count_tokens: Whether to compute token counts and check for summarization
             enable_thinking: Whether to enable thinking before making a decision
             reasoning_effort: The effort level for reasoning
             enable_context_manager: Whether to enable automatic context summarization.
@@ -265,34 +267,49 @@ Here are the XML tools available with examples:
 
                 # 2. Check token count before proceeding
                 token_count = 0
-                try:
-                    from litellm import token_counter
-                    # Use the potentially modified working_system_prompt for token counting
-                    token_count = token_counter(model=llm_model, messages=[working_system_prompt] + messages)
-                    token_threshold = self.context_manager.token_threshold
-                    logger.info(f"Thread {thread_id} token count: {token_count}/{token_threshold} ({(token_count/token_threshold)*100:.1f}%)")
+                if count_tokens:
+                    try:
+                        from litellm import token_counter
+                        # Use the potentially modified working_system_prompt for token counting
+                        token_count = token_counter(model=llm_model, messages=[working_system_prompt] + messages)
+                        token_threshold = self.context_manager.token_threshold
+                        logger.info(
+                            f"Thread {thread_id} token count: {token_count}/{token_threshold} ({(token_count/token_threshold)*100:.1f}%)"
+                        )
 
-                    # if token_count >= token_threshold and enable_context_manager:
-                    #     logger.info(f"Thread token count ({token_count}) exceeds threshold ({token_threshold}), summarizing...")
-                    #     summarized = await self.context_manager.check_and_summarize_if_needed(
-                    #         thread_id=thread_id,
-                    #         add_message_callback=self.add_message,
-                    #         model=llm_model,
-                    #         force=True
-                    #     )
-                    #     if summarized:
-                    #         logger.info("Summarization complete, fetching updated messages with summary")
-                    #         messages = await self.get_llm_messages(thread_id)
-                    #         # Recount tokens after summarization, using the modified prompt
-                    #         new_token_count = token_counter(model=llm_model, messages=[working_system_prompt] + messages)
-                    #         logger.info(f"After summarization: token count reduced from {token_count} to {new_token_count}")
-                    #     else:
-                    #         logger.warning("Summarization failed or wasn't needed - proceeding with original messages")
-                    # elif not enable_context_manager:
-                    #     logger.info("Automatic summarization disabled. Skipping token count check and summarization.")
+                        if token_count >= token_threshold and enable_context_manager:
+                            logger.info(
+                                f"Thread token count ({token_count}) exceeds threshold ({token_threshold}), summarizing..."
+                            )
+                            summarized = await self.context_manager.check_and_summarize_if_needed(
+                                thread_id=thread_id,
+                                add_message_callback=self.add_message,
+                                model=llm_model,
+                                force=True,
+                            )
+                            if summarized:
+                                logger.info(
+                                    "Summarization complete, fetching updated messages with summary"
+                                )
+                                messages = await self.get_llm_messages(thread_id)
+                                # Recount tokens after summarization, using the modified prompt
+                                token_count = token_counter(
+                                    model=llm_model, messages=[working_system_prompt] + messages
+                                )
+                                logger.info(
+                                    f"After summarization: token count reduced to {token_count}"
+                                )
+                            else:
+                                logger.warning(
+                                    "Summarization failed or wasn't needed - proceeding with original messages"
+                                )
+                        elif not enable_context_manager:
+                            logger.info(
+                                "Automatic summarization disabled. Skipping token count check and summarization."
+                            )
 
-                except Exception as e:
-                    logger.error(f"Error counting tokens or summarizing: {str(e)}")
+                    except Exception as e:
+                        logger.error(f"Error counting tokens or summarizing: {str(e)}")
 
                 # 3. Prepare messages for LLM call + add temporary message if it exists
                 # Use the working_system_prompt which may contain the XML examples

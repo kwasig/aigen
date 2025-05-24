@@ -38,7 +38,7 @@ class AgentStartRequest(BaseModel):
     enable_thinking: Optional[bool] = False
     reasoning_effort: Optional[str] = 'low'
     stream: Optional[bool] = True
-    enable_context_manager: Optional[bool] = False
+    enable_context_manager: Optional[bool] = True
 
 class InitiateAgentResponse(BaseModel):
     thread_id: str
