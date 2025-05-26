@@ -1,6 +1,6 @@
 MODEL_ACCESS_TIERS = {
     "free": [
-        "openrouter/deepseek/deepseek-chat",
+        "sambanova/DeepSeek-V3-0324",
         "openrouter/qwen/qwen3-235b-a22b",
         "openrouter/google/gemini-2.5-flash-preview-05-20",
     ],
@@ -117,7 +117,7 @@ MODEL_NAME_ALIASES = {
     # "gpt-4": "openai/gpt-4",  # Commented out in constants.py
     # "gemini-flash-2.5": "openrouter/google/gemini-2.5-flash-preview",  # Commented out in constants.py
     # "grok-3": "xai/grok-3-fast-latest",  # Commented out in constants.py
-    "deepseek": "openrouter/deepseek/deepseek-chat",
+    "deepseek": "sambanova/DeepSeek-V3-0324",
     # "deepseek-r1": "openrouter/deepseek/deepseek-r1",
     # "grok-3-mini": "xai/grok-3-mini-fast-beta",  # Commented out in constants.py
     "qwen3": "openrouter/qwen/qwen3-235b-a22b",  # Commented out in constants.py

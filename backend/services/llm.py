@@ -20,7 +20,7 @@ import litellm
 from litellm.utils import ModelResponse  # For reconstructing the response object
 from utils.logger import logger
 from utils.config import config
-from backend.services import redis as redis_service # Import redis service
+from . import redis as redis_service # Import redis service from same directory
 
 # litellm.set_verbose=True
 litellm.modify_params=True
@@ -330,9 +330,9 @@ async def make_llm_api_call(
     logger.info(f"📡 API Call (Non-Streaming): Using model {model_name}")
     
     redis_client = None # Initialize redis_client to None
-    try {
+    try:
         redis_client = await redis_service.get_client()
-    } except Exception as e:
+    except Exception as e:
         logger.error(f"Failed to get Redis client: {e}. Caching will be skipped.", exc_info=True)
 
     cache_key = None
@@ -372,27 +372,6 @@ async def make_llm_api_call(
     params = prepare_params(
         messages=messages,
         model_name=model_name,
-        "messages": messages,
-        "temperature": temperature,
-        # Add other parameters that significantly affect the response if necessary
-        # "max_tokens": max_tokens, 
-        # "response_format": response_format,
-        # "tools": tools,
-        # "tool_choice": tool_choice,
-        # "top_p": top_p,
-    }
-    
-    try:
-        serialized_messages = json.dumps(messages, sort_keys=True)
-        hashed_messages = hashlib.sha256(serialized_messages.encode('utf-8')).hexdigest()
-        cache_key = f"llm_cache:{model_name}:{temperature}:{hashed_messages}"
-    except Exception as e:
-        logger.warning(f"Error creating cache key: {e}. Bypassing cache.", exc_info=True)
-        cache_key = None
-
-    cache_key_parts = {
-        "model": model_name,
-        model_name=model_name,
         temperature=temperature,
         max_tokens=max_tokens,
         response_format=response_format,
@@ -406,6 +385,31 @@ async def make_llm_api_call(
         enable_thinking=enable_thinking,
         reasoning_effort=reasoning_effort
     )
+    
+    try:
+        serialized_messages = json.dumps(messages, sort_keys=True)
+        hashed_messages = hashlib.sha256(serialized_messages.encode('utf-8')).hexdigest()
+        cache_key = f"llm_cache:{model_name}:{temperature}:{hashed_messages}"
+    except Exception as e:
+        logger.warning(f"Error creating cache key: {e}. Bypassing cache.", exc_info=True)
+        cache_key = None
+
+    cache_key_parts = {
+        "model": model_name,
+        "model_name": model_name,
+        "temperature": temperature,
+        "max_tokens": max_tokens,
+        "response_format": response_format,
+        "tools": tools,
+        "tool_choice": tool_choice,
+        "api_key": api_key,
+        "api_base": api_base,
+        "stream": stream,
+        "top_p": top_p,
+        "model_id": model_id,
+        "enable_thinking": enable_thinking,
+        "reasoning_effort": reasoning_effort
+    }
     last_error = None
     for attempt in range(MAX_RETRIES):
         try:
