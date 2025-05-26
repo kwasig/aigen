@@ -13,15 +13,17 @@ import json
 import re
 import uuid
 import asyncio
+import hashlib # For hashing arguments
 from datetime import datetime, timezone
 from typing import List, Dict, Any, Optional, AsyncGenerator, Tuple, Union, Callable, Literal
-from dataclasses import dataclass
+from dataclasses import dataclass, asdict
 from utils.logger import logger
 from agentpress.tool import ToolResult
 from agentpress.tool_registry import ToolRegistry
 from litellm import completion_cost
 from langfuse.client import StatefulTraceClient
 from services.langfuse import langfuse
+from services import redis as redis_service # Import redis service
 from agentpress.utils.json_helpers import (
     ensure_dict, ensure_list, safe_json_parse, 
     to_json_string, format_for_yield
@@ -86,20 +88,46 @@ class ProcessorConfig:
 class ResponseProcessor:
     """Processes LLM responses, extracting and executing tool calls."""
     
-    def __init__(self, tool_registry: ToolRegistry, add_message_callback: Callable, trace: Optional[StatefulTraceClient] = None):
+    def __init__(self, 
+                 tool_registry: ToolRegistry, 
+                 add_message_callback: Callable, 
+                 add_messages_batch_callback: Callable, # New callback for batching
+                 trace: Optional[StatefulTraceClient] = None):
         """Initialize the ResponseProcessor.
         
         Args:
             tool_registry: Registry of available tools
-            add_message_callback: Callback function to add messages to the thread.
+            add_message_callback: Callback function to add a single message.
+            add_messages_batch_callback: Callback function to add a batch of messages.
                 MUST return the full saved message object (dict) or None.
         """
         self.tool_registry = tool_registry
         self.add_message = add_message_callback
+        self.add_messages_batch = add_messages_batch_callback # Store the new callback
         self.trace = trace
         if not self.trace:
             self.trace = langfuse.trace(name="anonymous:response_processor")
         
+        self.cost_message_buffer: List[Dict[str, Any]] = [] # Initialize buffer for cost messages
+
+    async def _flush_cost_messages_batch(self, thread_id: str):
+        """Flushes the buffered cost messages to the database."""
+        if not self.cost_message_buffer:
+            return
+
+        logger.info(f"Flushing {len(self.cost_message_buffer)} cost messages for thread {thread_id}.")
+        try:
+            # The callback 'self.add_messages_batch' points to ThreadManager.add_messages_batch
+            saved_messages = await self.add_messages_batch(thread_id=thread_id, messages_data=self.cost_message_buffer)
+            if saved_messages:
+                logger.info(f"Successfully flushed {len(saved_messages)} cost messages to DB.")
+            else:
+                logger.warning(f"Failed to flush cost messages or no data returned for thread {thread_id}.")
+        except Exception as e:
+            logger.error(f"Error flushing cost messages batch for thread {thread_id}: {e}", exc_info=True)
+        finally:
+            self.cost_message_buffer = [] # Clear buffer regardless of success or failure
+
     async def _yield_message(self, message_obj: Optional[Dict[str, Any]]) -> Dict[str, Any]:
         """Helper to yield a message with proper formatting.
         
@@ -564,18 +592,18 @@ class ResponseProcessor:
                         completion=accumulated_content
                     )
                     if final_cost is not None and final_cost > 0:
-                        logger.info(f"Calculated final cost for stream: {final_cost}")
-                        await self.add_message(
-                            thread_id=thread_id,
-                            type="cost",
-                            content={"cost": final_cost},
-                            is_llm_message=False, # Cost is metadata
-                            metadata={"thread_run_id": thread_run_id} # Keep track of the run
-                        )
-                        logger.info(f"Cost message saved for stream: {final_cost}")
-                        self.trace.update(metadata={"cost": final_cost})
+                        logger.info(f"Calculated final cost for stream: {final_cost}. Buffering cost message.")
+                        cost_message_data = {
+                            # thread_id will be set by add_messages_batch in ThreadManager
+                            "type": "cost",
+                            "content": {"cost": final_cost},
+                            "is_llm_message": False,
+                            "metadata": {"thread_run_id": thread_run_id}
+                        }
+                        self.cost_message_buffer.append(cost_message_data)
+                        self.trace.update(metadata={"cost": final_cost}) # Langfuse trace updated immediately
                     else:
-                         logger.info("Stream cost calculation resulted in zero or None, not storing cost message.")
+                         logger.info("Stream cost calculation resulted in zero or None, not buffering cost message.")
                          self.trace.update(metadata={"cost": 0})
                 except Exception as e:
                     logger.error(f"Error calculating final cost for stream: {str(e)}")
@@ -610,6 +638,9 @@ class ResponseProcessor:
         finally:
             # Save and Yield the final thread_run_end status
             try:
+                # Flush any buffered cost messages before ending the run
+                await self._flush_cost_messages_batch(thread_id)
+
                 end_content = {"status_type": "thread_run_end"}
                 end_msg_obj = await self.add_message(
                     thread_id=thread_id, type="status", content=end_content, 
@@ -617,8 +648,8 @@ class ResponseProcessor:
                 )
                 if end_msg_obj: yield format_for_yield(end_msg_obj)
             except Exception as final_e:
-                logger.error(f"Error in finally block: {str(final_e)}", exc_info=True)
-                self.trace.event(name="error_in_finally_block", level="ERROR", status_message=(f"Error in finally block: {str(final_e)}"))
+                logger.error(f"Error in finally block (streaming): {str(final_e)}", exc_info=True)
+                self.trace.event(name="error_in_finally_block_streaming", level="ERROR", status_message=(f"Error in finally block (streaming): {str(final_e)}"))
 
     async def process_non_streaming_response(
         self,
@@ -730,26 +761,23 @@ class ResponseProcessor:
 
                     if final_cost is None: # Fall back to calculating cost if direct cost not available or zero
                         logger.info("Calculating cost using completion_cost function.")
-                        # Note: litellm might need 'messages' kwarg depending on model/provider
                         final_cost = completion_cost(
                             completion_response=llm_response,
-                            model=llm_model, # Explicitly pass the model name
-                            # messages=prompt_messages # Pass prompt messages if needed by litellm for this model
+                            model=llm_model,
                         )
 
                     if final_cost is not None and final_cost > 0:
-                        logger.info(f"Calculated final cost for non-stream: {final_cost}")
-                        await self.add_message(
-                            thread_id=thread_id,
-                            type="cost",
-                            content={"cost": final_cost},
-                            is_llm_message=False, # Cost is metadata
-                            metadata={"thread_run_id": thread_run_id} # Keep track of the run
-                        )
-                        logger.info(f"Cost message saved for non-stream: {final_cost}")
-                        self.trace.update(metadata={"cost": final_cost})
+                        logger.info(f"Calculated final cost for non-stream: {final_cost}. Buffering cost message.")
+                        cost_message_data = {
+                            "type": "cost",
+                            "content": {"cost": final_cost},
+                            "is_llm_message": False,
+                            "metadata": {"thread_run_id": thread_run_id}
+                        }
+                        self.cost_message_buffer.append(cost_message_data)
+                        self.trace.update(metadata={"cost": final_cost}) # Langfuse trace updated immediately
                     else:
-                        logger.info("Non-stream cost calculation resulted in zero or None, not storing cost message.")
+                        logger.info("Non-stream cost calculation resulted in zero or None, not buffering cost message.")
                         self.trace.update(metadata={"cost": 0})
 
                 except Exception as e:
@@ -773,9 +801,11 @@ class ResponseProcessor:
                     )
                     context.result = result
 
-                    # Save and Yield start status
-                    started_msg_obj = await self._yield_and_save_tool_started(context, thread_id, thread_run_id)
-                    if started_msg_obj: yield format_for_yield(started_msg_obj)
+                    # In non-streaming, tool_started is immediately followed by tool_completed.
+                    # The DB write for "tool_started" is removed to reduce writes.
+                    # The client will still see "tool_completed" or "tool_failed"/"tool_error",
+                    # which contains all necessary identifying info (tool_call_id, index, name).
+                    logger.debug(f"Skipping save/yield of 'tool_started' for non-streaming tool call index {tool_index} ({context.function_name}).")
 
                     # Save tool result
                     saved_tool_result_object = await self._add_tool_result(
@@ -827,6 +857,9 @@ class ResponseProcessor:
              raise # Use bare 'raise' to preserve the original exception with its traceback
 
         finally:
+            # Flush any buffered cost messages before ending the run
+            await self._flush_cost_messages_batch(thread_id)
+
              # Save and Yield the final thread_run_end status
             end_content = {"status_type": "thread_run_end"}
             end_msg_obj = await self.add_message(
@@ -1115,38 +1148,108 @@ class ResponseProcessor:
 
     # Tool execution methods
     async def _execute_tool(self, tool_call: Dict[str, Any]) -> ToolResult:
-        """Execute a single tool call and return the result."""
-        span = self.trace.span(name=f"execute_tool.{tool_call['function_name']}", input=tool_call["arguments"])            
-        try:
-            function_name = tool_call["function_name"]
-            arguments = tool_call["arguments"]
+        """Execute a single tool call, with caching, and return the result."""
+        span = self.trace.span(name=f"execute_tool.{tool_call['function_name']}", input=tool_call["arguments"])
+        
+        function_name = tool_call["function_name"]
+        arguments = tool_call["arguments"] # These are already parsed by the time they reach here usually
+        
+        redis_client = None
+        cache_key = None
+        cache_ttl = 3600 # 1 hour expiration for tool results
 
+        try:
+            redis_client = await redis_service.get_client()
+        except Exception as e:
+            logger.warning(f"Failed to get Redis client for tool caching: {e}. Proceeding without cache.", exc_info=True)
+            redis_client = None # Ensure it's None
+
+        if redis_client:
+            try:
+                # Ensure arguments is a dict for consistent serialization, even if originally a string for some tools
+                args_for_key = arguments if isinstance(arguments, dict) else {"_raw_args": arguments}
+                serialized_args = json.dumps(args_for_key, sort_keys=True)
+                hashed_args = hashlib.sha256(serialized_args.encode('utf-8')).hexdigest()
+                cache_key = f"tool_cache:{function_name}:{hashed_args}"
+                
+                cached_result_json = await redis_client.get(cache_key)
+                if cached_result_json:
+                    logger.info(f"Tool result cache hit for key: {cache_key}")
+                    self.trace.event(name="tool_cache_hit", level="INFO", metadata={"cache_key": cache_key})
+                    cached_data_dict = json.loads(cached_result_json)
+                    # ToolResult expects 'success' and 'output'
+                    reconstructed_result = ToolResult(success=cached_data_dict['success'], output=cached_data_dict['output'])
+                    span.end(status_message="tool_cache_hit", output=reconstructed_result)
+                    return reconstructed_result
+                else:
+                    logger.info(f"Tool result cache miss for key: {cache_key}")
+                    self.trace.event(name="tool_cache_miss", level="INFO", metadata={"cache_key": cache_key})
+            except Exception as e:
+                logger.warning(f"Error during tool cache retrieval for {function_name}: {e}. Proceeding with execution.", exc_info=True)
+                # If cache retrieval fails, proceed to execute the tool normally
+
+        # Actual tool execution
+        try:
             logger.info(f"Executing tool: {function_name} with arguments: {arguments}")
             self.trace.event(name="executing_tool", level="INFO", status_message=(f"Executing tool: {function_name} with arguments: {arguments}"))
             
-            if isinstance(arguments, str):
+            current_arguments = arguments
+            if isinstance(current_arguments, str): # Some tools might still expect string args to be parsed by them
                 try:
-                    arguments = safe_json_parse(arguments)
+                    # Attempt to parse if it's JSON string, otherwise pass as is if tool expects raw string
+                    parsed_args = safe_json_parse(current_arguments)
+                    if isinstance(parsed_args, dict): # only use if successfully parsed to dict
+                         current_arguments = parsed_args
+                    # If not a dict, it might be a raw string argument for a tool, keep as is.
+                    # Or, if tools always expect dicts, this might need adjustment.
+                    # For now, assume tools handle their expected argument types.
                 except json.JSONDecodeError:
-                    arguments = {"text": arguments}
-            
-            # Get available functions from tool registry
+                    # If it's not a valid JSON string, and the tool expects a dictionary,
+                    # this might be an issue. However, many tools are registered with specific
+                    # argument types. If a tool expects a simple string, this is fine.
+                    # If it expects a dict but gets a non-JSON string, it will likely fail below.
+                    # The safest bet is that `arguments` should be a dict by now if the tool expects one.
+                    # If a tool specifically takes a raw string arg, it's fine.
+                    # Let's assume if it's a string, it's meant to be a string arg, or the tool handles it.
+                    # For safety, if a tool expects a dict, arguments should be a dict.
+                    # The `arguments` field in `tool_call` should ideally be prepared correctly before this point.
+                    # If a tool is defined to take specific named string arguments, they would be in a dict.
+                    # If a tool takes a single string argument like `{"text": "content"}`, that's fine.
+                     pass # Keep arguments as string if not valid JSON and tool might expect raw string.
+
             available_functions = self.tool_registry.get_available_functions()
-            
-            # Look up the function by name
             tool_fn = available_functions.get(function_name)
+            
             if not tool_fn:
                 logger.error(f"Tool function '{function_name}' not found in registry")
                 span.end(status_message="tool_not_found", level="ERROR")
                 return ToolResult(success=False, output=f"Tool function '{function_name}' not found")
             
             logger.debug(f"Found tool function for '{function_name}', executing...")
-            result = await tool_fn(**arguments)
+            # Ensure arguments are passed correctly, especially if they were originally a string
+            # and the tool expects keyword arguments.
+            if isinstance(current_arguments, dict):
+                result = await tool_fn(**current_arguments)
+            else: # Tool expects a single positional argument or handles raw string
+                result = await tool_fn(current_arguments)
+
             logger.info(f"Tool execution complete: {function_name} -> {result}")
             span.end(status_message="tool_executed", output=result)
+
+            if redis_client and cache_key and result.success:
+                try:
+                    # Use asdict for dataclasses if ToolResult is a dataclass, otherwise vars()
+                    result_to_cache_dict = asdict(result) if hasattr(result, '__dataclass_fields__') else vars(result)
+                    serialized_result = json.dumps(result_to_cache_dict)
+                    await redis_client.set(cache_key, serialized_result, ex=cache_ttl)
+                    logger.info(f"Tool result for {function_name} stored in cache: {cache_key}")
+                except Exception as e:
+                    logger.warning(f"Error storing tool result in cache for {function_name}: {e}", exc_info=True)
+            
             return result
+            
         except Exception as e:
-            logger.error(f"Error executing tool {tool_call['function_name']}: {str(e)}", exc_info=True)
+            logger.error(f"Error executing tool {function_name}: {str(e)}", exc_info=True)
             span.end(status_message="tool_execution_error", output=f"Error executing tool: {str(e)}", level="ERROR")
             return ToolResult(success=False, output=f"Error executing tool: {str(e)}")
 

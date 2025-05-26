@@ -49,6 +49,7 @@ class ThreadManager:
         self.response_processor = ResponseProcessor(
             tool_registry=self.tool_registry,
             add_message_callback=self.add_message,
+            add_messages_batch_callback=self.add_messages_batch, # Pass the new batch method
             trace=self.trace
         )
         self.context_manager = ContextManager()
@@ -102,6 +103,49 @@ class ThreadManager:
         except Exception as e:
             logger.error(f"Failed to add message to thread {thread_id}: {str(e)}", exc_info=True)
             raise
+
+    async def add_messages_batch(
+        self,
+        thread_id: str, # Included for consistency, though messages should have thread_id
+        messages_data: List[Dict[str, Any]]
+    ) -> List[Dict[str, Any]]:
+        """Add multiple messages to the thread in the database in a single batch.
+
+        Args:
+            thread_id: The ID of the thread these messages belong to.
+            messages_data: A list of dictionaries, where each dictionary represents a message
+                           and conforms to the structure expected by the 'messages' table
+                           (e.g., includes 'thread_id', 'type', 'content', 'is_llm_message', 'metadata').
+
+        Returns:
+            A list of the inserted message objects, including their database-assigned IDs
+            and timestamps, or an empty list if the operation failed or returned no data.
+        """
+        if not messages_data:
+            logger.debug("No messages provided to add_messages_batch.")
+            return []
+
+        logger.debug(f"Adding batch of {len(messages_data)} messages to thread {thread_id}")
+        client = await self.db.client
+
+        try:
+            # Ensure all messages in the batch have the correct thread_id
+            for msg_data in messages_data:
+                msg_data['thread_id'] = thread_id
+
+            result = await client.table('messages').insert(messages_data, returning='representation').execute()
+            
+            if result.data and len(result.data) > 0:
+                logger.info(f"Successfully added batch of {len(result.data)} messages to thread {thread_id}")
+                return result.data
+            else:
+                logger.error(f"Batch insert operation failed or did not return expected data structure for thread {thread_id}. Result data: {result.data}")
+                return []
+        except Exception as e:
+            logger.error(f"Failed to add batch of messages to thread {thread_id}: {str(e)}", exc_info=True)
+            # Depending on requirements, could raise or return empty list/partial success.
+            # For now, returning empty list on error.
+            return []
 
     async def get_llm_messages(self, thread_id: str) -> List[Dict[str, Any]]:
         """Get all messages for a thread.
@@ -204,17 +248,33 @@ class ThreadManager:
         # Log model info
         logger.info(f"🤖 Thread {thread_id}: Using model {llm_model}")
 
-        # Apply max_xml_tool_calls if specified and not already set in config
-        if max_xml_tool_calls > 0 and not processor_config.max_xml_tool_calls:
-            processor_config.max_xml_tool_calls = max_xml_tool_calls
+        # Ensure processor_config is an instance.
+        # If None is passed, a default ProcessorConfig() is used.
+        # The caller can control tool_execution_strategy by passing a ProcessorConfig
+        # instance with the desired strategy.
+        if processor_config is None:
+            logger.info("No ProcessorConfig provided to run_thread, creating default instance.")
+            processor_config = ProcessorConfig()
+        else:
+            logger.info(f"Using provided ProcessorConfig. XML Tool Calling: {processor_config.xml_tool_calling}, Native Tool Calling: {processor_config.native_tool_calling}, Strategy: {processor_config.tool_execution_strategy}")
+
+        # Override max_xml_tool_calls in the config if it's explicitly set in run_thread parameters
+        # A value > 0 in run_thread's max_xml_tool_calls parameter takes precedence.
+        if max_xml_tool_calls > 0:
+            if processor_config.max_xml_tool_calls != max_xml_tool_calls:
+                logger.info(f"Overriding processor_config.max_xml_tool_calls (was {processor_config.max_xml_tool_calls}) with value from run_thread parameter: {max_xml_tool_calls}")
+                processor_config.max_xml_tool_calls = max_xml_tool_calls
+        # If max_xml_tool_calls is 0 or not set in run_thread params, the value in processor_config (passed or default) is used.
 
         # Create a working copy of the system prompt to potentially modify
         working_system_prompt = system_prompt.copy()
 
         # Add XML examples to system prompt if requested, do this only ONCE before the loop
-        if include_xml_examples and processor_config.xml_tool_calling:
+        # Ensure processor_config is not None before accessing its attributes.
+        if processor_config and include_xml_examples and processor_config.xml_tool_calling:
             xml_examples = self.tool_registry.get_xml_examples()
             if xml_examples:
+                logger.debug("XML tool calling enabled, examples requested, and examples found. Adding to prompt.")
                 examples_content = """
 --- XML TOOL CALLING ---
 
@@ -246,13 +306,37 @@ Here are the XML tools available with examples:
                     for item in working_system_prompt['content']: # Modify the copy
                         if isinstance(item, dict) and item.get('type') == 'text' and 'text' in item:
                             item['text'] += examples_content
-                            logger.debug("Appended XML examples to the first text block in list system prompt content.")
+                            logger.debug("Appended XML examples to a text block in list system prompt content.")
                             appended = True
-                            break
+                            break # Assuming we only append to the first text block found
                     if not appended:
-                        logger.warning("System prompt content is a list but no text block found to append XML examples.")
+                        logger.warning("System prompt content is a list but no suitable text block found to append XML examples.")
                 else:
                     logger.warning(f"System prompt content is of unexpected type ({type(system_content)}), cannot add XML examples.")
+            else:
+                logger.debug("XML tool calling enabled and examples requested, but no XML examples found in registry. Skipping.")
+        else:
+            # Log why XML examples are being skipped
+            details = []
+            if not processor_config:
+                details.append("processor_config is None")
+            else: # processor_config is not None here
+                if not include_xml_examples:
+                    details.append("include_xml_examples is False")
+                if not processor_config.xml_tool_calling: # This is safe due to the main 'if' condition structure
+                    details.append("processor_config.xml_tool_calling is False")
+            
+            # If all conditions were met but xml_examples was empty, that's handled by the "no XML examples found in registry" log.
+            # This else block is for when the main 'if' condition (processor_config and include_xml_examples and processor_config.xml_tool_calling) is false.
+            if details: # Only log if there are specific reasons from the main condition
+                 logger.info(f"Skipping XML tool examples because a condition was not met: {'; '.join(details)}.")
+            # If for some reason details is empty but we are in this else block, it implies the initial 'if' was false
+            # but none of the specific checks in this 'else' block caught the reason.
+            # This shouldn't happen with the current logic but adding a fallback log.
+            elif not (processor_config and include_xml_examples and processor_config.xml_tool_calling):
+                 logger.info("Skipping XML tool examples for an undetermined reason (main condition check failed).")
+
+
         # Control whether we need to auto-continue due to tool_calls finish reason
         auto_continue = True
         auto_continue_count = 0
@@ -260,10 +344,9 @@ Here are the XML tools available with examples:
         # Define inner function to handle a single run
         async def _run_once(temp_msg=None):
             try:
-                # Ensure processor_config is available in this scope
-                nonlocal processor_config
-                # Note: processor_config is now guaranteed to exist due to check above
-
+                # Ensure processor_config is available in this scope (it is, due to handling above)
+                # nonlocal processor_config # Not needed as it's passed or created in the outer scope and used directly.
+                
                 # 1. Get messages from thread for LLM call
                 messages = await self.get_llm_messages(thread_id)
 
