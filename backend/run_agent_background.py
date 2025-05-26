@@ -76,6 +76,7 @@ async def run_agent_background(
     async def check_for_stop_signal():
         nonlocal stop_signal_received
         if not pubsub: return
+        last_ttl_refresh_time = asyncio.get_event_loop().time() # Initialize for time-based TTL refresh
         try:
             while not stop_signal_received:
                 message = await pubsub.get_message(ignore_subscribe_messages=True, timeout=0.5)
@@ -86,11 +87,18 @@ async def run_agent_background(
                         logger.info(f"Received STOP signal for agent run {agent_run_id} (Instance: {instance_id})")
                         stop_signal_received = True
                         break
-                # Periodically refresh the active run key TTL
-                if total_responses % 50 == 0: # Refresh every 50 responses or so
-                    try: await redis.expire(instance_active_key, redis.REDIS_KEY_TTL)
-                    except Exception as ttl_err: logger.warning(f"Failed to refresh TTL for {instance_active_key}: {ttl_err}")
-                await asyncio.sleep(0.1) # Short sleep to prevent tight loop
+                
+                # Time-based TTL refresh for instance_active_key
+                current_time = asyncio.get_event_loop().time()
+                if current_time - last_ttl_refresh_time > 30: # Refresh approximately every 30 seconds
+                    try:
+                        logger.info(f"Refreshing TTL for instance_active_key: {instance_active_key}")
+                        await redis.expire(instance_active_key, redis.REDIS_KEY_TTL)
+                        last_ttl_refresh_time = current_time
+                    except Exception as ttl_err:
+                        logger.warning(f"Failed to refresh TTL for {instance_active_key}: {ttl_err}")
+                
+                await asyncio.sleep(0.3) # Adjusted sleep duration
         except asyncio.CancelledError:
             logger.info(f"Stop signal checker cancelled for {agent_run_id} (Instance: {instance_id})")
         except Exception as e:

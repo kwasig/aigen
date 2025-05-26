@@ -108,7 +108,74 @@ class ResponseProcessor:
         if not self.trace:
             self.trace = langfuse.trace(name="anonymous:response_processor")
         
-        self.cost_message_buffer: List[Dict[str, Any]] = [] # Initialize buffer for cost messages
+        self.cost_message_buffer: List[Dict[str, Any]] = []
+        self.status_message_buffer: List[Dict[str, Any]] = []
+        self.STATUS_MESSAGE_BATCH_SIZE = 10 # Configurable batch size for status messages
+
+    async def _flush_status_messages_batch(self, thread_id: str):
+        """Flushes the buffered status messages to the database."""
+        if not self.status_message_buffer:
+            return
+
+        logger.info(f"Flushing {len(self.status_message_buffer)} status messages for thread {thread_id}.")
+        try:
+            # messages_data should be a list of dicts, each dict being the raw data for a message
+            saved_messages = await self.add_messages_batch(thread_id=thread_id, messages_data=self.status_message_buffer)
+            if saved_messages:
+                logger.info(f"Successfully flushed {len(saved_messages)} status messages to DB.")
+            else:
+                logger.warning(f"Failed to flush status messages or no data returned for thread {thread_id}.")
+        except Exception as e:
+            logger.error(f"Error flushing status messages batch for thread {thread_id}: {e}", exc_info=True)
+        finally:
+            self.status_message_buffer = []
+
+    async def _prepare_and_buffer_status_message(
+        self, 
+        thread_id: str, 
+        content_payload: Dict[str, Any], 
+        metadata_payload: Optional[Dict[str, Any]], 
+        thread_run_id: str 
+    ) -> Dict[str, Any]:
+        """
+        Constructs a message object for yielding, prepares data for DB batching,
+        and buffers it. Flushes buffer if size exceeds threshold.
+        The 'type' of the message is fixed to 'status'.
+        """
+        temp_message_id = str(uuid.uuid4())
+        now_iso = datetime.now(timezone.utc).isoformat()
+
+        current_metadata = metadata_payload if metadata_payload is not None else {}
+        current_metadata["thread_run_id"] = thread_run_id 
+
+        # Object to be yielded (simulates a saved message object structure)
+        yield_object = {
+            "message_id": temp_message_id,
+            "thread_id": thread_id,
+            "type": "status", 
+            "content": content_payload, # Will be a dict, format_for_yield will stringify
+            "is_llm_message": False,
+            "metadata": current_metadata, # Will be a dict, format_for_yield will stringify
+            "created_at": now_iso,
+            "updated_at": now_iso
+        }
+
+        # Data to be stored in DB 
+        db_message_data = {
+            "thread_id": thread_id, 
+            "type": "status",
+            "content": content_payload, # Stored as JSONB
+            "is_llm_message": False,
+            "metadata": current_metadata # Stored as JSONB
+        }
+        
+        self.status_message_buffer.append(db_message_data)
+        
+        if len(self.status_message_buffer) >= self.STATUS_MESSAGE_BATCH_SIZE:
+            logger.debug(f"Status message buffer reached size {self.STATUS_MESSAGE_BATCH_SIZE}. Flushing for thread {thread_id}.")
+            await self._flush_status_messages_batch(thread_id)
+            
+        return yield_object
 
     async def _flush_cost_messages_batch(self, thread_id: str):
         """Flushes the buffered cost messages to the database."""
@@ -175,20 +242,20 @@ class ResponseProcessor:
         thread_run_id = str(uuid.uuid4())
 
         try:
-            # --- Save and Yield Start Events ---
-            start_content = {"status_type": "thread_run_start", "thread_run_id": thread_run_id}
-            start_msg_obj = await self.add_message(
-                thread_id=thread_id, type="status", content=start_content, 
-                is_llm_message=False, metadata={"thread_run_id": thread_run_id}
+            # --- Buffer and Yield Start Events ---
+            start_content_payload = {"status_type": "thread_run_start", "thread_run_id": thread_run_id}
+            start_metadata_payload = {"thread_run_id": thread_run_id} 
+            start_msg_yield_obj = await self._prepare_and_buffer_status_message(
+                thread_id, start_content_payload, start_metadata_payload, thread_run_id
             )
-            if start_msg_obj: yield format_for_yield(start_msg_obj)
+            if start_msg_yield_obj: yield format_for_yield(start_msg_yield_obj)
 
-            assist_start_content = {"status_type": "assistant_response_start"}
-            assist_start_msg_obj = await self.add_message(
-                thread_id=thread_id, type="status", content=assist_start_content, 
-                is_llm_message=False, metadata={"thread_run_id": thread_run_id}
+            assist_start_content_payload = {"status_type": "assistant_response_start"}
+            assist_start_metadata_payload = {"thread_run_id": thread_run_id}
+            assist_start_yield_obj = await self._prepare_and_buffer_status_message(
+                thread_id, assist_start_content_payload, assist_start_metadata_payload, thread_run_id
             )
-            if assist_start_msg_obj: yield format_for_yield(assist_start_msg_obj)
+            if assist_start_yield_obj: yield format_for_yield(assist_start_yield_obj)
             # --- End Start Events ---
 
             __sequence = 0
@@ -622,15 +689,16 @@ class ResponseProcessor:
         except Exception as e:
             logger.error(f"Error processing stream: {str(e)}", exc_info=True)
             self.trace.event(name="error_processing_stream", level="ERROR", status_message=(f"Error processing stream: {str(e)}"))
-            # Save and yield error status message
-            err_content = {"role": "system", "status_type": "error", "message": str(e)}
-            err_msg_obj = await self.add_message(
-                thread_id=thread_id, type="status", content=err_content, 
-                is_llm_message=False, metadata={"thread_run_id": thread_run_id if 'thread_run_id' in locals() else None}
+            # Buffer and yield error status message
+            err_content_payload = {"role": "system", "status_type": "error", "message": str(e)}
+            current_thread_run_id_on_error = locals().get("thread_run_id", "unknown_run_id_on_error") 
+            err_metadata_payload = {"thread_run_id": current_thread_run_id_on_error}
+            err_yield_obj = await self._prepare_and_buffer_status_message(
+                thread_id, err_content_payload, err_metadata_payload, current_thread_run_id_on_error
             )
-            if err_msg_obj: yield format_for_yield(err_msg_obj) # Yield the saved error message
+            if err_yield_obj: yield format_for_yield(err_yield_obj)
             
-            # Re-raise the same exception (not a new one) to ensure proper error propagation
+            # Re-raise the same exception
             logger.critical(f"Re-raising error to stop further processing: {str(e)}")
             self.trace.event(name="re_raising_error_to_stop_further_processing", level="ERROR", status_message=(f"Re-raising error to stop further processing: {str(e)}"))
             raise # Use bare 'raise' to preserve the original exception with its traceback
@@ -638,18 +706,25 @@ class ResponseProcessor:
         finally:
             # Save and Yield the final thread_run_end status
             try:
-                # Flush any buffered cost messages before ending the run
+                # Flush any buffered cost and status messages before ending the run
                 await self._flush_cost_messages_batch(thread_id)
+                await self._flush_status_messages_batch(thread_id) 
 
-                end_content = {"status_type": "thread_run_end"}
-                end_msg_obj = await self.add_message(
-                    thread_id=thread_id, type="status", content=end_content, 
-                    is_llm_message=False, metadata={"thread_run_id": thread_run_id if 'thread_run_id' in locals() else None}
+                end_content_payload = {"status_type": "thread_run_end"}
+                current_thread_run_id_finally = locals().get("thread_run_id", "unknown_run_id_on_error")
+                end_metadata_payload = {"thread_run_id": current_thread_run_id_finally}
+                end_yield_obj = await self._prepare_and_buffer_status_message(
+                     thread_id, end_content_payload, end_metadata_payload, current_thread_run_id_finally
                 )
-                if end_msg_obj: yield format_for_yield(end_msg_obj)
+                if end_yield_obj: yield format_for_yield(end_yield_obj)
+                
+                await self._flush_status_messages_batch(thread_id) # Final flush
+
             except Exception as final_e:
                 logger.error(f"Error in finally block (streaming): {str(final_e)}", exc_info=True)
                 self.trace.event(name="error_in_finally_block_streaming", level="ERROR", status_message=(f"Error in finally block (streaming): {str(final_e)}"))
+                await self._flush_status_messages_batch(thread_id) # Attempt to flush even on error
+
 
     async def process_non_streaming_response(
         self,

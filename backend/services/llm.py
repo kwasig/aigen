@@ -328,48 +328,10 @@ async def make_llm_api_call(
 
     # --- Caching Logic for Non-Streaming Calls ---
     logger.info(f"📡 API Call (Non-Streaming): Using model {model_name}")
-    
-    redis_client = None # Initialize redis_client to None
-    try:
-        redis_client = await redis_service.get_client()
-    except Exception as e:
-        logger.error(f"Failed to get Redis client: {e}. Caching will be skipped.", exc_info=True)
 
-    cache_key = None
-    if redis_client: # Only proceed with cache key generation if redis_client is available
-        try:
-            serialized_messages = json.dumps(messages, sort_keys=True)
-            hashed_messages = hashlib.sha256(serialized_messages.encode('utf-8')).hexdigest()
-            cache_key = f"llm_cache:{model_name}:{temperature}:{hashed_messages}"
-        except Exception as e:
-            logger.warning(f"Error creating cache key: {e}. Bypassing cache.", exc_info=True)
-            cache_key = None # Ensure cache_key is None if generation fails
-    else:
-        logger.info("Redis client not available. Skipping cache attempt.")
-
-
-    if cache_key and redis_client: # Ensure both are valid before trying to get from cache
-        try:
-            # No need to call get_client() again, already have redis_client
-            cached_response_json = await redis_service.get(cache_key)
-            if cached_response_json:
-                logger.info(f"LLM response retrieved from cache for key: {cache_key}")
-                try:
-                    cached_response_dict = json.loads(cached_response_json)
-                    response = ModelResponse(**cached_response_dict)
-                    return response
-                except json.JSONDecodeError:
-                    logger.warning(f"Error decoding cached JSON for key {cache_key}. Fetching fresh response.", exc_info=True)
-                except TypeError as te: 
-                    logger.warning(f"Error reconstructing ModelResponse from cached data for key {cache_key}: {te}. Fetching fresh response.", exc_info=True)
-            # else: No message here, cache miss is logged later if we proceed to API call
-        except Exception as e: 
-            logger.error(f"Redis error during cache retrieval for key {cache_key}: {e}. Bypassing cache.", exc_info=True)
-            # If Redis fails during get, we fall through to fresh call.
-    
-    logger.info(f"LLM response not found in cache or cache bypassed for key: {cache_key if cache_key else 'N/A'}. Proceeding with API call.")
-
-    params = prepare_params(
+    # Prepare parameters once, as they might influence the cache key
+    # (e.g., if prepare_params modifies model_name, temperature for reasoning_effort, etc.)
+    params_for_api = prepare_params( # Renamed to avoid confusion with function-level params
         messages=messages,
         model_name=model_name,
         temperature=temperature,
@@ -379,70 +341,115 @@ async def make_llm_api_call(
         tool_choice=tool_choice,
         api_key=api_key,
         api_base=api_base,
-        stream=stream,
+        stream=stream, # Will be False here
         top_p=top_p,
         model_id=model_id,
         enable_thinking=enable_thinking,
         reasoning_effort=reasoning_effort
     )
-    
-    try:
-        serialized_messages = json.dumps(messages, sort_keys=True)
-        hashed_messages = hashlib.sha256(serialized_messages.encode('utf-8')).hexdigest()
-        cache_key = f"llm_cache:{model_name}:{temperature}:{hashed_messages}"
-    except Exception as e:
-        logger.warning(f"Error creating cache key: {e}. Bypassing cache.", exc_info=True)
-        cache_key = None
 
-    cache_key_parts = {
-        "model": model_name,
-        "model_name": model_name,
-        "temperature": temperature,
-        "max_tokens": max_tokens,
-        "response_format": response_format,
-        "tools": tools,
-        "tool_choice": tool_choice,
-        "api_key": api_key,
-        "api_base": api_base,
-        "stream": stream,
-        "top_p": top_p,
-        "model_id": model_id,
-        "enable_thinking": enable_thinking,
-        "reasoning_effort": reasoning_effort
-    }
+    redis_client = None
+    cache_key = None
+
+    try:
+        redis_client = await redis_service.get_client()
+    except Exception as e:
+        logger.error(f"Failed to get Redis client: {e}. Caching will be skipped.", exc_info=True)
+
+    if redis_client:
+        try:
+            # Use parameters that define the request, including those potentially modified by prepare_params
+            # For example, 'model' from params_for_api, 'temperature' if modified by reasoning_effort, etc.
+            key_params = {
+                "model_name": params_for_api.get("model", model_name), # Use model from prepared_params
+                "messages": messages, # Original messages
+                "temperature": params_for_api.get("temperature", temperature), # Temperature from prepared_params
+                "max_tokens": params_for_api.get("max_tokens") or params_for_api.get("max_completion_tokens"),
+                "response_format": response_format,
+                "tools": tools,
+                "tool_choice": tool_choice,
+                "top_p": top_p,
+                # "reasoning_effort" is implicitly handled if it changes temperature or other params in prepare_params
+                # However, if reasoning_effort itself should be a key component (even if it doesn't change other params), add it.
+                # For now, assuming its effects are captured by changes in other params like temperature.
+                "reasoning_effort": params_for_api.get("reasoning_effort"), # Explicitly add reasoning_effort
+            }
+            cache_key = _generate_cache_key(**key_params)
+            
+            cached_response_json = await redis_service.get(cache_key)
+            if cached_response_json:
+                logger.info(f"LLM response retrieved from cache for key: {cache_key}")
+                try:
+                    cached_response_dict = json.loads(cached_response_json)
+                    # Ensure 'id' is present if ModelResponse expects it and it's not always in cached_response_dict
+                    # This might require inspecting what litellm.ModelResponse strictly needs for instantiation
+                    if 'id' not in cached_response_dict and hasattr(ModelResponse, "id"):
+                        # If 'id' is a required field for ModelResponse and not in cache, 
+                        # it might be better to treat as a cache miss or add a placeholder.
+                        # For now, we assume 'id' might not be strictly necessary or is usually present.
+                        # Alternatively, if 'id' should be unique per request, it shouldn't come from cache anyway,
+                        # or the cache structure needs to account for it.
+                        # LiteLLM ModelResponse objects *do* have an 'id' field.
+                        # If it's not critical for the functioning of the app, it might be okay.
+                        # Otherwise, a new 'id' could be generated, or this indicates an issue
+                        # with what was originally cached.
+                        # For safety, if 'id' is missing and important, one might log a warning
+                        # or even invalidate this specific cache entry.
+                        # The original code did ModelResponse(**cached_response_dict), let's stick to that
+                        # and assume 'id' and other fields are handled correctly by litellm's Pydantic model.
+                        pass
+
+                    response = ModelResponse(**cached_response_dict)
+                    return response
+                except json.JSONDecodeError:
+                    logger.warning(f"Error decoding cached JSON for key {cache_key}. Fetching fresh response.", exc_info=True)
+                except TypeError as te:
+                    logger.warning(f"Error reconstructing ModelResponse from cached data for key {cache_key}: {te}. Fetching fresh response.", exc_info=True)
+                # If deserialization fails, proceed to API call (cache miss)
+        except redis_service.redis.exceptions.RedisError as re: # More specific Redis error
+            logger.error(f"Redis error during cache retrieval for key {cache_key}: {re}. Bypassing cache.", exc_info=True)
+        except Exception as e:
+            logger.warning(f"Error during cache check for key {cache_key}: {e}. Bypassing cache.", exc_info=True)
+            cache_key = None # Invalidate cache_key if generation or initial check fails
+
+    if cache_key:
+        logger.info(f"LLM response not found in cache for key: {cache_key}. Proceeding with API call.")
+    else:
+        logger.info("Cache bypassed (Redis client unavailable or error in key generation). Proceeding with API call.")
+
+    # API call parameters are already prepared in params_for_api
     last_error = None
     for attempt in range(MAX_RETRIES):
         try:
             logger.debug(f"Attempt {attempt + 1}/{MAX_RETRIES}")
-            # logger.debug(f"API request parameters: {json.dumps(params, indent=2)}")
+            # Use the already prepared params_for_api
+            api_response = await litellm.acompletion(**params_for_api)
+            logger.debug(f"Successfully received API response from {params_for_api.get('model', model_name)}")
+            # logger.debug(f"Response: {api_response}") # Can be very verbose
 
-            api_response = await litellm.acompletion(**params)
-            logger.debug(f"Successfully received API response from {model_name}")
-            logger.debug(f"Response: {api_response}")
-
-            # Store in cache if cache_key was generated and response is not an error
-            if cache_key and api_response and redis_client: # Ensure redis_client is available
+            # Store in cache if cache_key was generated, redis_client is available, and response is valid
+            if cache_key and redis_client and api_response:
                 try:
-                    # Assuming api_response is a litellm.ModelResponse object
-                    # It should have model_dump_json() or model_dump() methods
+                    response_to_cache_json = None
                     if hasattr(api_response, 'model_dump_json'):
                         response_to_cache_json = api_response.model_dump_json()
-                    elif hasattr(api_response, 'dict'): # Fallback for older litellm or pydantic v1
+                    elif hasattr(api_response, 'dict'): 
                         response_to_cache_json = json.dumps(api_response.dict())
                     else:
-                        # If neither, this will likely fail, or we need a specific way to serialize
+                        # If neither, this will likely fail
                         logger.warning("Cannot serialize API response for caching: no model_dump_json or dict method.")
-                        response_to_cache_json = None
                     
                     if response_to_cache_json:
                         await redis_service.set(cache_key, response_to_cache_json, ex=redis_service.REDIS_KEY_TTL)
                         logger.info(f"LLM response stored in cache for key: {cache_key}")
-                except Exception as e:
-                    logger.error(f"Redis error during cache storage for key {cache_key}: {e}", exc_info=True)
+                except redis_service.redis.exceptions.RedisError as re: # More specific Redis error
+                    logger.error(f"Redis error during cache storage for key {cache_key}: {re}", exc_info=True)
+                except Exception as e: # Catch other potential errors during serialization/storage
+                    logger.error(f"Error during cache storage preparation for key {cache_key}: {e}", exc_info=True)
             
             return api_response
 
-        except (litellm.exceptions.RateLimitError, OpenAIError, json.JSONDecodeError) as e:
+        except (litellm.exceptions.RateLimitError, OpenAIError, json.JSONDecodeError, litellm.exceptions.APIConnectionError) as e: # Added APIConnectionError
             last_error = e
             await handle_error(e, attempt, MAX_RETRIES)
 
@@ -455,6 +462,52 @@ async def make_llm_api_call(
         error_msg += f". Last error: {str(last_error)}"
     logger.error(error_msg, exc_info=True)
     raise LLMRetryError(error_msg)
+
+# Helper function to generate cache key
+def _generate_cache_key(
+    model_name: str,
+    messages: List[Dict[str, Any]],
+    temperature: float,
+    max_tokens: Optional[int],
+    response_format: Optional[Any],
+    tools: Optional[List[Dict[str, Any]]],
+    tool_choice: Optional[str], # tool_choice can be None if tools are not used
+    top_p: Optional[float],
+    reasoning_effort: Optional[str] # Added based on requirements
+) -> str:
+    """Generates a SHA256 hash key for caching LLM responses."""
+    try:
+        # Deterministic serialization for complex objects
+        serialized_messages = json.dumps(messages, sort_keys=True)
+        serialized_tools = json.dumps(tools, sort_keys=True) if tools else "None"
+        serialized_response_format = json.dumps(response_format, sort_keys=True) if response_format else "None"
+
+        key_string_parts = [
+            str(model_name),
+            serialized_messages,
+            str(temperature),
+            str(max_tokens),
+            serialized_response_format,
+            serialized_tools,
+            str(tool_choice),
+            str(top_p),
+            str(reasoning_effort),
+        ]
+        
+        # Filter out None parts if they were converted to "None" strings unnecessarily,
+        # or ensure consistent string representation for all parts.
+        # The current approach of str(None) becoming "None" is fine for consistency.
+        
+        key_string = ":".join(key_string_parts)
+        
+        return f"llm_cache:{hashlib.sha256(key_string.encode('utf-8')).hexdigest()}"
+    except Exception as e:
+        logger.error(f"Error generating cache key: {e}", exc_info=True)
+        # Fallback to a less specific key or indicate error if necessary,
+        # but for now, re-raise or handle by returning a key that won't be found.
+        # For simplicity, let this error propagate to be caught by the caller's cache bypass logic.
+        raise
+
 
 # Initialize API keys on module import
 setup_api_keys()

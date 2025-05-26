@@ -396,13 +396,16 @@ class SandboxWebSearchTool(SandboxToolsBase):
             
             # Save results to a file in the /workspace/scrape directory
             scrape_dir = f"{self.workspace_path}/scrape"
-            self.sandbox.fs.create_folder(scrape_dir, "755")
+            # Wrap SDK call with asyncio.to_thread
+            await asyncio.to_thread(self.sandbox.fs.create_folder, scrape_dir, "755")
             
             results_file_path = f"{scrape_dir}/{safe_filename}"
             json_content = json.dumps(formatted_result, ensure_ascii=False, indent=2)
             logging.info(f"Saving content to file: {results_file_path}, size: {len(json_content)} bytes")
             
-            self.sandbox.fs.upload_file(
+            # Wrap SDK call with asyncio.to_thread
+            await asyncio.to_thread(
+                self.sandbox.fs.upload_file,
                 results_file_path, 
                 json_content.encode()
             )

@@ -1,3 +1,4 @@
+import asyncio # Import asyncio
 from typing import Optional, Dict, Any
 import time
 from uuid import uuid4
@@ -20,7 +21,8 @@ class SandboxShellTool(SandboxToolsBase):
             session_id = str(uuid4())
             try:
                 await self._ensure_sandbox()  # Ensure sandbox is initialized
-                self.sandbox.process.create_session(session_id)
+                # Wrap SDK call with asyncio.to_thread
+                await asyncio.to_thread(self.sandbox.process.create_session, session_id)
                 self._sessions[session_name] = session_id
             except Exception as e:
                 raise RuntimeError(f"Failed to create session: {str(e)}")
@@ -31,7 +33,8 @@ class SandboxShellTool(SandboxToolsBase):
         if session_name in self._sessions:
             try:
                 await self._ensure_sandbox()  # Ensure sandbox is initialized
-                self.sandbox.process.delete_session(self._sessions[session_name])
+                # Wrap SDK call with asyncio.to_thread
+                await asyncio.to_thread(self.sandbox.process.delete_session, self._sessions[session_name])
                 del self._sessions[session_name]
             except Exception as e:
                 print(f"Warning: Failed to cleanup session {session_name}: {str(e)}")
@@ -213,7 +216,9 @@ class SandboxShellTool(SandboxToolsBase):
             timeout=30  # Short timeout for utility commands
         )
         
-        logs = self.sandbox.process.get_session_command_logs(
+        # Wrap SDK call with asyncio.to_thread
+        logs = await asyncio.to_thread(
+            self.sandbox.process.get_session_command_logs,
             session_id=session_id,
             command_id=response.cmd_id
         )
